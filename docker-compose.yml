@@ -1,0 +1,31 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: amankan-postgres
+    environment:
+      POSTGRES_USER: amankan
+      POSTGRES_PASSWORD: amankan
+      POSTGRES_DB: amankan
+    ports:
+      - "5544:5432"
+    volumes:
+      - amankan_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U amankan"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    container_name: amankan-redis
+    ports:
+      - "6399:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  amankan_pgdata:
