@@ -16,7 +16,14 @@ type Config struct {
 	NucleiBin      string
 	ScanTimeout    time.Duration
 	AllowLiveScan  bool
+
+	Neo4jURI  string
+	Neo4jUser string
+	Neo4jPass string
 }
+
+// GraphEnabled reports whether graph (Neo4j) integration is configured.
+func (c Config) GraphEnabled() bool { return c.Neo4jURI != "" }
 
 func Load() Config {
 	return Config{
@@ -28,6 +35,9 @@ func Load() Config {
 		NucleiBin:     env("AMANKAN_NUCLEI_BIN", "nuclei"),
 		ScanTimeout:   time.Duration(envInt("AMANKAN_SCAN_TIMEOUT_SECONDS", 120)) * time.Second,
 		AllowLiveScan: envBool("AMANKAN_ALLOW_LIVE_SCAN", false),
+		Neo4jURI:      env("AMANKAN_NEO4J_URI", "bolt://localhost:7688"),
+		Neo4jUser:     env("AMANKAN_NEO4J_USER", "neo4j"),
+		Neo4jPass:     env("AMANKAN_NEO4J_PASS", "amankanpass"),
 	}
 }
 

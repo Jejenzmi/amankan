@@ -8,6 +8,7 @@ import (
 	"log"
 
 	"github.com/amankan/amankan/internal/config"
+	"github.com/amankan/amankan/internal/graph"
 	"github.com/amankan/amankan/internal/normalize"
 	"github.com/amankan/amankan/internal/scanner"
 	"github.com/amankan/amankan/internal/store"
@@ -15,13 +16,16 @@ import (
 
 type Processor struct {
 	store *store.Store
+	graph *graph.Graph // optional; nil when graph integration is disabled
 	opts  scanner.Options
 	cfg   config.Config
 }
 
-func NewProcessor(st *store.Store, cfg config.Config) *Processor {
+// NewProcessor builds a processor. graph may be nil (graph component disabled).
+func NewProcessor(st *store.Store, g *graph.Graph, cfg config.Config) *Processor {
 	return &Processor{
 		store: st,
+		graph: g,
 		cfg:   cfg,
 		opts: scanner.Options{
 			NmapBin:       cfg.NmapBin,
@@ -47,6 +51,14 @@ func (p *Processor) Process(ctx context.Context, scanJobID string) error {
 	}
 	log.Printf("scan %s: running profile=%s asset=%s target=%s", job.ID, job.Profile, asset.Name, asset.Target)
 
+	// Project the asset into the graph so attack-path analysis sees it even if
+	// no findings result. Graph errors are non-fatal to the scan.
+	if p.graph != nil {
+		if err := p.graph.SyncAsset(ctx, *asset); err != nil {
+			log.Printf("scan %s: graph sync asset error: %v", job.ID, err)
+		}
+	}
+
 	scanCtx, cancel := context.WithTimeout(ctx, p.cfg.ScanTimeout)
 	defer cancel()
 
@@ -71,6 +83,11 @@ func (p *Processor) Process(ctx context.Context, scanJobID string) error {
 			if err := p.store.CreateFinding(scanCtx, &findings[i]); err != nil {
 				log.Printf("scan %s: persist finding error: %v", job.ID, err)
 				continue
+			}
+			if p.graph != nil {
+				if err := p.graph.SyncFinding(scanCtx, findings[i]); err != nil {
+					log.Printf("scan %s: graph sync finding error: %v", job.ID, err)
+				}
 			}
 			total++
 		}

@@ -5,12 +5,14 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"strconv"
 	"time"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
 
 	"github.com/amankan/amankan/internal/compliance"
+	"github.com/amankan/amankan/internal/graph"
 	"github.com/amankan/amankan/internal/models"
 	"github.com/amankan/amankan/internal/queue"
 	"github.com/amankan/amankan/internal/store"
@@ -19,10 +21,11 @@ import (
 type API struct {
 	store *store.Store
 	queue *queue.Queue
+	graph *graph.Graph // optional; nil when graph integration is disabled
 }
 
-func New(st *store.Store, q *queue.Queue) *API {
-	return &API{store: st, queue: q}
+func New(st *store.Store, q *queue.Queue, g *graph.Graph) *API {
+	return &API{store: st, queue: q, graph: g}
 }
 
 func (a *API) Router() http.Handler {
@@ -46,6 +49,11 @@ func (a *API) Router() http.Handler {
 		r.Patch("/findings/{id}/status", a.updateFindingStatus)
 
 		r.Get("/compliance/cwe/{cwe}", a.complianceForCWE)
+
+		// Graph Analysis Engine (attack paths / lateral movement).
+		r.Post("/graph/sync", a.graphSync)
+		r.Post("/assets/{id}/reachability", a.addReachability)
+		r.Get("/assets/{id}/attack-paths", a.attackPaths) // ?min_risk= &max_hops=
 	})
 
 	return r
@@ -190,6 +198,125 @@ func (a *API) complianceForCWE(w http.ResponseWriter, r *http.Request) {
 		"compliance":  compliance.Refs(cwe),
 		"remediation": compliance.Remediation(cwe),
 	})
+}
+
+// ---- graph / attack paths ----
+
+// graphSync re-projects all assets and findings from PostgreSQL into Neo4j.
+// Useful after enabling the graph on an existing dataset.
+func (a *API) graphSync(w http.ResponseWriter, r *http.Request) {
+	if a.graph == nil {
+		graphDisabled(w)
+		return
+	}
+	ctx := r.Context()
+	assets, err := a.store.ListAssets(ctx)
+	if err != nil {
+		serverError(w, err)
+		return
+	}
+	syncedAssets, syncedVulns := 0, 0
+	for _, as := range assets {
+		if err := a.graph.SyncAsset(ctx, as); err != nil {
+			serverError(w, err)
+			return
+		}
+		syncedAssets++
+		findings, err := a.store.ListFindings(ctx, as.ID, "")
+		if err != nil {
+			serverError(w, err)
+			return
+		}
+		for _, f := range findings {
+			if err := a.graph.SyncFinding(ctx, f); err != nil {
+				serverError(w, err)
+				return
+			}
+			syncedVulns++
+		}
+	}
+	writeJSON(w, http.StatusOK, map[string]int{"assets": syncedAssets, "vulnerabilities": syncedVulns})
+}
+
+// addReachability records a network reachability edge (source -> destination),
+// a candidate lateral-movement hop used by attack-path analysis.
+func (a *API) addReachability(w http.ResponseWriter, r *http.Request) {
+	if a.graph == nil {
+		graphDisabled(w)
+		return
+	}
+	srcID := chi.URLParam(r, "id")
+	var in struct {
+		TargetID string `json:"target_id"`
+		Port     int    `json:"port"`
+		Proto    string `json:"proto"`
+	}
+	if err := decode(r, &in); err != nil {
+		badRequest(w, err.Error())
+		return
+	}
+	if in.TargetID == "" {
+		badRequest(w, "target_id is required")
+		return
+	}
+	if in.Proto == "" {
+		in.Proto = "tcp"
+	}
+	// Ensure both assets exist before drawing the edge.
+	if _, err := a.store.GetAsset(r.Context(), srcID); err != nil {
+		notFoundOrError(w, err)
+		return
+	}
+	if _, err := a.store.GetAsset(r.Context(), in.TargetID); err != nil {
+		notFoundOrError(w, err)
+		return
+	}
+	if err := a.graph.UpsertReachability(r.Context(), srcID, in.TargetID, in.Port, in.Proto); err != nil {
+		serverError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusCreated, map[string]any{"from": srcID, "to": in.TargetID, "port": in.Port, "proto": in.Proto})
+}
+
+// attackPaths returns attack paths that lead to the given asset (the crown jewel).
+func (a *API) attackPaths(w http.ResponseWriter, r *http.Request) {
+	if a.graph == nil {
+		graphDisabled(w)
+		return
+	}
+	targetID := chi.URLParam(r, "id")
+	if _, err := a.store.GetAsset(r.Context(), targetID); err != nil {
+		notFoundOrError(w, err)
+		return
+	}
+	minRisk := 7.0
+	if v := r.URL.Query().Get("min_risk"); v != "" {
+		if f, err := strconv.ParseFloat(v, 64); err == nil {
+			minRisk = f
+		}
+	}
+	maxHops := 4
+	if v := r.URL.Query().Get("max_hops"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			maxHops = n
+		}
+	}
+	paths, err := a.graph.FindAttackPaths(r.Context(), targetID, minRisk, maxHops)
+	if err != nil {
+		serverError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"target_id": targetID,
+		"min_risk":  minRisk,
+		"max_hops":  maxHops,
+		"count":     len(paths),
+		"paths":     paths,
+	})
+}
+
+func graphDisabled(w http.ResponseWriter) {
+	writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "graph component disabled (set AMANKAN_NEO4J_URI)"})
 }
 
 func (a *API) health(w http.ResponseWriter, r *http.Request) {

@@ -1,10 +1,13 @@
-.PHONY: up down api worker build migrate tidy seed test smoke
+.PHONY: up down api worker build migrate tidy seed test smoke graph-up attackpath
 
 up:
 	docker compose up -d
 
 down:
 	docker compose down
+
+graph-up:
+	docker compose up -d neo4j
 
 tidy:
 	go mod tidy
@@ -25,3 +28,6 @@ worker:
 
 smoke:
 	./scripts/smoke.sh
+
+attackpath:
+	./scripts/attackpath.sh

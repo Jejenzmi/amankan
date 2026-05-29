@@ -20,10 +20,11 @@ RabbitMQ, ELK) are out of scope for Phase 1 and noted as integration seams.
 | Compliance Policy Engine | `internal/compliance`: CWE → OWASP Top10/ASVS → ISO 27001 → BSSN/Indeks KAMI → COBIT |
 | Remediation | Actionable steps + compliance references attached per finding |
 | Primary DB | PostgreSQL (transactional data) |
+| **Graph Analysis Engine** | **Neo4j** (`internal/graph`): assets + vulns as a graph, reachability edges, **attack-path / lateral-movement** detection |
 
 ### Not in Phase 1 (integration seams)
-Neo4j attack-path graph, Kubernetes Jobs, Keycloak OAuth2, RabbitMQ, ELK,
-immutable/signed logs, automated patch testing, Next.js dashboard.
+Kubernetes Jobs, Keycloak OAuth2, RabbitMQ, ELK, immutable/signed logs,
+automated patch testing, Next.js dashboard.
 
 ## Architecture
 
@@ -73,6 +74,9 @@ make smoke
 | `GET` | `/api/v1/findings?asset_id=&scan_id=` | findings, sorted by risk score |
 | `PATCH` | `/api/v1/findings/{id}/status` | validate / mark false-positive / remediated |
 | `GET` | `/api/v1/compliance/cwe/{cwe}` | governance mapping + remediation for a CWE |
+| `POST` | `/api/v1/graph/sync` | (re)project all assets + findings into Neo4j |
+| `POST` | `/api/v1/assets/{id}/reachability` | add a reachability edge (`target_id`, `port`) — a lateral-movement hop |
+| `GET` | `/api/v1/assets/{id}/attack-paths` | attack paths leading to this asset (`min_risk`, `max_hops`) |
 
 ### Example
 
@@ -89,6 +93,30 @@ curl -XPOST localhost:8080/api/v1/assets/<asset-id>/scans \
 curl 'localhost:8080/api/v1/findings?asset_id=<asset-id>'
 ```
 
+## Attack-path / lateral movement (Neo4j)
+
+The graph engine answers: *"how can an attacker reach the crown-jewel asset?"*
+A valid attack path starts at an **internet-exposed** asset (tagged `public`/
+`external`) and every node on it carries an **exploitable** vulnerability
+(`risk >= min_risk`). Edges are network reachability (`CAN_REACH`).
+
+```bash
+make graph-up        # start Neo4j (browser at http://localhost:7474, user neo4j / amankanpass)
+make attackpath      # builds a 3-tier topology, scans it, queries attack paths
+```
+
+Example output (`scripts/attackpath.sh`):
+
+```
+Path 1: web-dmz -> app-server -> db-core  (edges=2, max_risk=10)
+    - web-dmz      [ENTRY/external]   via Apache Log4j RCE (Log4Shell) (risk 10, CWE-502)
+    - app-server   [high]             via Apache Log4j RCE (Log4Shell) (risk 10, CWE-502)
+    - db-core      [critical]         via Weak TLS protocol version (TLS 1.0) (risk 10, CWE-327)
+```
+
+> The graph is **optional**: leave `AMANKAN_NEO4J_URI` empty (or stop Neo4j) and
+> the API/worker still run — graph endpoints just return `503`.
+
 ## Layout
 
 ```
@@ -103,12 +131,12 @@ internal/
   normalize    scanner output → internal Finding schema
   risk         CVSS × criticality × threat-intel scoring
   compliance   CWE → OWASP/ISO27001/BSSN/COBIT + remediation
+  graph        Neo4j projection + attack-path / lateral-movement queries
   engine       single-job orchestration
 ```
 
 ## Next steps (toward the full platform)
-1. Add Neo4j to model assets/vulns/privileges and compute **attack paths** (lateral movement).
+1. ~~Neo4j attack-path graph~~ ✅ done — extend with user-privilege nodes and `apoc` weighted shortest paths.
 2. Replace the Redis list with RabbitMQ + Kubernetes Jobs for isolated, scalable scans.
 3. Front with Keycloak (OAuth2/OIDC) and add the Next.js + Ant Design Pro dashboard.
 4. Sign + ship logs to immutable storage (BSSN forensic retention) and ELK.
-```

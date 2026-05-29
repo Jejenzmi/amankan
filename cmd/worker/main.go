@@ -12,6 +12,7 @@ import (
 	"github.com/amankan/amankan/internal/config"
 	"github.com/amankan/amankan/internal/db"
 	"github.com/amankan/amankan/internal/engine"
+	"github.com/amankan/amankan/internal/graph"
 	"github.com/amankan/amankan/internal/queue"
 	"github.com/amankan/amankan/internal/store"
 )
@@ -33,8 +34,19 @@ func main() {
 	}
 	defer q.Close()
 
+	var g *graph.Graph
+	if cfg.GraphEnabled() {
+		if g, err = graph.Connect(ctx, cfg.Neo4jURI, cfg.Neo4jUser, cfg.Neo4jPass); err != nil {
+			log.Printf("graph disabled: %v", err)
+			g = nil
+		} else {
+			log.Printf("graph (Neo4j) connected at %s", cfg.Neo4jURI)
+			defer g.Close(ctx)
+		}
+	}
+
 	st := store.New(pool)
-	proc := engine.NewProcessor(st, cfg)
+	proc := engine.NewProcessor(st, g, cfg)
 
 	log.Println("Amankan worker started, waiting for scan jobs...")
 	for {
