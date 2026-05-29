@@ -31,3 +31,6 @@ smoke:
 
 attackpath:
 	./scripts/attackpath.sh
+
+privesc:
+	./scripts/privesc.sh

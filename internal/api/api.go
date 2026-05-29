@@ -10,6 +10,7 @@ import (
 
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
+	"github.com/google/uuid"
 
 	"github.com/amankan/amankan/internal/compliance"
 	"github.com/amankan/amankan/internal/graph"
@@ -54,6 +55,12 @@ func (a *API) Router() http.Handler {
 		r.Post("/graph/sync", a.graphSync)
 		r.Post("/assets/{id}/reachability", a.addReachability)
 		r.Get("/assets/{id}/attack-paths", a.attackPaths) // ?min_risk= &max_hops=
+
+		// Privilege-escalation graph (accounts + weighted escalation/reuse edges).
+		r.Post("/accounts", a.createAccount)
+		r.Post("/accounts/{id}/escalation", a.addEscalation)
+		r.Post("/accounts/{id}/credential-reuse", a.addCredentialReuse)
+		r.Get("/privesc-path", a.privEscPath) // ?from= &to=
 	})
 
 	return r
@@ -313,6 +320,151 @@ func (a *API) attackPaths(w http.ResponseWriter, r *http.Request) {
 		"count":     len(paths),
 		"paths":     paths,
 	})
+}
+
+// ---- accounts / privilege escalation ----
+
+var validPrivileges = map[string]bool{
+	"user": true, "service": true, "admin": true, "root": true, "domain_admin": true,
+}
+
+// createAccount registers a principal on an asset in the privilege graph.
+func (a *API) createAccount(w http.ResponseWriter, r *http.Request) {
+	if a.graph == nil {
+		graphDisabled(w)
+		return
+	}
+	var in struct {
+		AssetID   string `json:"asset_id"`
+		Username  string `json:"username"`
+		Privilege string `json:"privilege"`
+	}
+	if err := decode(r, &in); err != nil {
+		badRequest(w, err.Error())
+		return
+	}
+	if in.AssetID == "" || in.Username == "" {
+		badRequest(w, "asset_id and username are required")
+		return
+	}
+	if in.Privilege == "" {
+		in.Privilege = "user"
+	}
+	if !validPrivileges[in.Privilege] {
+		badRequest(w, "invalid privilege (user|service|admin|root|domain_admin)")
+		return
+	}
+	asset, err := a.store.GetAsset(r.Context(), in.AssetID)
+	if err != nil {
+		notFoundOrError(w, err)
+		return
+	}
+	// Ensure the asset node exists in the graph before linking an account to it
+	// (the asset may not have been scanned/synced yet).
+	if err := a.graph.SyncAsset(r.Context(), *asset); err != nil {
+		serverError(w, err)
+		return
+	}
+	acc := graph.Account{ID: uuid.NewString(), Username: in.Username, Privilege: in.Privilege, AssetID: in.AssetID}
+	if err := a.graph.SyncAccount(r.Context(), acc); err != nil {
+		serverError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusCreated, acc)
+}
+
+// addEscalation adds a local privilege-escalation edge between two accounts.
+func (a *API) addEscalation(w http.ResponseWriter, r *http.Request) {
+	if a.graph == nil {
+		graphDisabled(w)
+		return
+	}
+	var in struct {
+		TargetAccountID string  `json:"target_account_id"`
+		Technique       string  `json:"technique"`
+		CWE             string  `json:"cwe"`
+		Weight          float64 `json:"weight"`
+	}
+	if err := decode(r, &in); err != nil {
+		badRequest(w, err.Error())
+		return
+	}
+	if in.TargetAccountID == "" {
+		badRequest(w, "target_account_id is required")
+		return
+	}
+	if in.Weight <= 0 {
+		in.Weight = 1.0 // a known local exploit is cheap by default
+	}
+	ok, err := a.graph.UpsertEscalation(r.Context(), chi.URLParam(r, "id"), in.TargetAccountID, in.Technique, in.CWE, in.Weight)
+	if err != nil {
+		serverError(w, err)
+		return
+	}
+	if !ok {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "one or both accounts not found"})
+		return
+	}
+	writeJSON(w, http.StatusCreated, map[string]any{
+		"from": chi.URLParam(r, "id"), "to": in.TargetAccountID,
+		"type": "CAN_ESCALATE", "technique": in.Technique, "weight": in.Weight,
+	})
+}
+
+// addCredentialReuse adds a lateral credential-reuse edge between two accounts.
+func (a *API) addCredentialReuse(w http.ResponseWriter, r *http.Request) {
+	if a.graph == nil {
+		graphDisabled(w)
+		return
+	}
+	var in struct {
+		TargetAccountID string  `json:"target_account_id"`
+		Weight          float64 `json:"weight"`
+	}
+	if err := decode(r, &in); err != nil {
+		badRequest(w, err.Error())
+		return
+	}
+	if in.TargetAccountID == "" {
+		badRequest(w, "target_account_id is required")
+		return
+	}
+	if in.Weight <= 0 {
+		in.Weight = 3.0 // credential reuse is plausible but costlier than a local exploit
+	}
+	ok, err := a.graph.UpsertCredentialReuse(r.Context(), chi.URLParam(r, "id"), in.TargetAccountID, in.Weight)
+	if err != nil {
+		serverError(w, err)
+		return
+	}
+	if !ok {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "one or both accounts not found"})
+		return
+	}
+	writeJSON(w, http.StatusCreated, map[string]any{
+		"from": chi.URLParam(r, "id"), "to": in.TargetAccountID,
+		"type": "CREDENTIAL_REUSE", "weight": in.Weight,
+	})
+}
+
+// privEscPath returns the minimum-effort privilege-escalation path between two accounts.
+func (a *API) privEscPath(w http.ResponseWriter, r *http.Request) {
+	if a.graph == nil {
+		graphDisabled(w)
+		return
+	}
+	from := r.URL.Query().Get("from")
+	to := r.URL.Query().Get("to")
+	if from == "" || to == "" {
+		badRequest(w, "from and to query params are required")
+		return
+	}
+	path, err := a.graph.FindPrivEscPath(r.Context(), from, to)
+	if err != nil {
+		serverError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, path)
 }
 
 func graphDisabled(w http.ResponseWriter) {

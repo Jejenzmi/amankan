@@ -44,6 +44,7 @@ func (g *Graph) ensureConstraints(ctx context.Context) error {
 	stmts := []string{
 		"CREATE CONSTRAINT asset_id IF NOT EXISTS FOR (a:Asset) REQUIRE a.id IS UNIQUE",
 		"CREATE CONSTRAINT vuln_id IF NOT EXISTS FOR (v:Vulnerability) REQUIRE v.id IS UNIQUE",
+		"CREATE CONSTRAINT account_id IF NOT EXISTS FOR (acc:Account) REQUIRE acc.id IS UNIQUE",
 	}
 	for _, s := range stmts {
 		if err := g.write(ctx, s, nil); err != nil {
@@ -96,6 +97,156 @@ func (g *Graph) UpsertReachability(ctx context.Context, srcID, dstID string, por
 		 MERGE (s)-[r:CAN_REACH]->(d)
 		 SET r.port=$port, r.proto=$proto`,
 		map[string]any{"src": srcID, "dst": dstID, "port": port, "proto": proto})
+}
+
+// ---- accounts / privilege escalation ----
+
+// Account is a graph-only principal living on an asset at some privilege level.
+// Privilege escalation and credential reuse between accounts are modeled as
+// weighted edges so attack paths capture *how an attacker gains privilege*, not
+// just which hosts are network-reachable.
+type Account struct {
+	ID        string `json:"id"`
+	Username  string `json:"username"`
+	Privilege string `json:"privilege"` // user | service | admin | root | domain_admin
+	AssetID   string `json:"asset_id"`
+}
+
+// SyncAccount upserts an account node and links it to its asset.
+func (g *Graph) SyncAccount(ctx context.Context, a Account) error {
+	return g.write(ctx,
+		`MATCH (asset:Asset {id:$assetId})
+		 MERGE (acc:Account {id:$id})
+		 SET acc.username=$username, acc.privilege=$privilege, acc.asset_id=$assetId
+		 MERGE (asset)-[:HAS_ACCOUNT]->(acc)`,
+		map[string]any{"id": a.ID, "username": a.Username, "privilege": a.Privilege, "assetId": a.AssetID})
+}
+
+// UpsertEscalation records a local privilege-escalation edge between two
+// accounts on the same asset (e.g. user -> root via a kernel CVE). weight is the
+// attacker effort (lower = easier); Dijkstra minimizes total weight.
+func (g *Graph) UpsertEscalation(ctx context.Context, fromID, toID, technique, cwe string, weight float64) (bool, error) {
+	return g.edge(ctx, "CAN_ESCALATE", fromID, toID,
+		map[string]any{"technique": technique, "cwe": cwe, "weight": weight})
+}
+
+// UpsertCredentialReuse records a lateral-movement edge where credentials valid
+// for the source account also grant access to the destination account on
+// another asset (credential reuse / pass-the-hash).
+func (g *Graph) UpsertCredentialReuse(ctx context.Context, fromID, toID string, weight float64) (bool, error) {
+	return g.edge(ctx, "CREDENTIAL_REUSE", fromID, toID, map[string]any{"weight": weight})
+}
+
+// edge upserts a typed relationship between two accounts, returning whether both
+// endpoints existed (and the edge was therefore created/updated).
+func (g *Graph) edge(ctx context.Context, relType, fromID, toID string, props map[string]any) (bool, error) {
+	params := map[string]any{"from": fromID, "to": toID}
+	for k, v := range props {
+		params[k] = v
+	}
+	setClauses := ""
+	for k := range props {
+		setClauses += fmt.Sprintf(" SET r.%s=$%s", k, k)
+	}
+	cypher := fmt.Sprintf(
+		`MATCH (a:Account {id:$from}), (b:Account {id:$to})
+		 MERGE (a)-[r:%s]->(b)%s
+		 RETURN count(r) AS c`, relType, setClauses)
+
+	recs, err := g.writeReturn(ctx, cypher, params)
+	if err != nil {
+		return false, err
+	}
+	if len(recs) == 0 {
+		return false, nil
+	}
+	c, _ := recs[0].Get("c")
+	return toInt(c) > 0, nil
+}
+
+// PrivEscStep is one weighted edge along a privilege-escalation path.
+type PrivEscStep struct {
+	Type      string  `json:"type"` // CAN_ESCALATE | CREDENTIAL_REUSE
+	Technique string  `json:"technique,omitempty"`
+	CWE       string  `json:"cwe,omitempty"`
+	Weight    float64 `json:"weight"`
+}
+
+// PrivEscNode is one account on a privilege-escalation path.
+type PrivEscNode struct {
+	AccountID string `json:"account_id"`
+	Username  string `json:"username"`
+	Privilege string `json:"privilege"`
+	Asset     string `json:"asset"`
+}
+
+// PrivEscPath is the cheapest (lowest total effort) privilege-escalation chain.
+type PrivEscPath struct {
+	Accounts  []PrivEscNode `json:"accounts"`
+	Steps     []PrivEscStep `json:"steps"`
+	TotalCost float64       `json:"total_cost"`
+	Found     bool          `json:"found"`
+}
+
+// FindPrivEscPath uses apoc.algo.dijkstra to find the minimum-effort privilege
+// escalation path from a foothold account to a target privileged account,
+// traversing CAN_ESCALATE (intra-host) and CREDENTIAL_REUSE (inter-host) edges.
+func (g *Graph) FindPrivEscPath(ctx context.Context, startID, targetID string) (PrivEscPath, error) {
+	cypher := `
+		MATCH (start:Account {id:$startId}), (target:Account {id:$targetId})
+		CALL apoc.algo.dijkstra(start, target, 'CAN_ESCALATE>|CREDENTIAL_REUSE>', 'weight')
+		YIELD path, weight
+		RETURN [n IN nodes(path) | {
+		         id: n.id, username: n.username, privilege: n.privilege,
+		         asset: head([ (asset:Asset)-[:HAS_ACCOUNT]->(n) | asset.name ])
+		       }] AS accounts,
+		       [r IN relationships(path) | {
+		         type: type(r), technique: r.technique, cwe: r.cwe, weight: r.weight
+		       }] AS steps,
+		       weight AS total_cost
+		ORDER BY total_cost ASC
+		LIMIT 1`
+
+	recs, err := g.read(ctx, cypher, map[string]any{"startId": startID, "targetId": targetID})
+	if err != nil {
+		return PrivEscPath{}, err
+	}
+	if len(recs) == 0 {
+		return PrivEscPath{Found: false}, nil
+	}
+	rec := recs[0]
+	out := PrivEscPath{Found: true}
+	costAny, _ := rec.Get("total_cost")
+	out.TotalCost = round2(toFloat(costAny))
+
+	accAny, _ := rec.Get("accounts")
+	for _, a := range asSlice(accAny) {
+		am, _ := a.(map[string]any)
+		out.Accounts = append(out.Accounts, PrivEscNode{
+			AccountID: toStr(am["id"]),
+			Username:  toStr(am["username"]),
+			Privilege: toStr(am["privilege"]),
+			Asset:     toStr(am["asset"]),
+		})
+	}
+	stepsAny, _ := rec.Get("steps")
+	for _, s := range asSlice(stepsAny) {
+		sm, _ := s.(map[string]any)
+		out.Steps = append(out.Steps, PrivEscStep{
+			Type:      toStr(sm["type"]),
+			Technique: toStr(sm["technique"]),
+			CWE:       toStr(sm["cwe"]),
+			Weight:    round2(toFloat(sm["weight"])),
+		})
+	}
+	return out, nil
+}
+
+func asSlice(v any) []any {
+	if s, ok := v.([]any); ok {
+		return s
+	}
+	return nil
 }
 
 // Hop is one node along an attack path, with the vulnerability that enables
@@ -208,6 +359,24 @@ func (g *Graph) write(ctx context.Context, cypher string, params map[string]any)
 		return res.Consume(ctx)
 	})
 	return err
+}
+
+// writeReturn runs a write transaction that also yields rows (e.g. MERGE ... RETURN).
+func (g *Graph) writeReturn(ctx context.Context, cypher string, params map[string]any) ([]*neo4j.Record, error) {
+	session := g.driver.NewSession(ctx, neo4j.SessionConfig{AccessMode: neo4j.AccessModeWrite})
+	defer session.Close(ctx)
+	out, err := session.ExecuteWrite(ctx, func(tx neo4j.ManagedTransaction) (any, error) {
+		res, err := tx.Run(ctx, cypher, params)
+		if err != nil {
+			return nil, err
+		}
+		return res.Collect(ctx)
+	})
+	if err != nil {
+		return nil, err
+	}
+	recs, _ := out.([]*neo4j.Record)
+	return recs, nil
 }
 
 func (g *Graph) read(ctx context.Context, cypher string, params map[string]any) ([]*neo4j.Record, error) {

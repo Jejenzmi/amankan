@@ -77,6 +77,10 @@ make smoke
 | `POST` | `/api/v1/graph/sync` | (re)project all assets + findings into Neo4j |
 | `POST` | `/api/v1/assets/{id}/reachability` | add a reachability edge (`target_id`, `port`) — a lateral-movement hop |
 | `GET` | `/api/v1/assets/{id}/attack-paths` | attack paths leading to this asset (`min_risk`, `max_hops`) |
+| `POST` | `/api/v1/accounts` | register a principal on an asset (`asset_id`, `username`, `privilege`) |
+| `POST` | `/api/v1/accounts/{id}/escalation` | local priv-esc edge (`target_account_id`, `technique`, `cwe`, `weight`) |
+| `POST` | `/api/v1/accounts/{id}/credential-reuse` | lateral credential-reuse edge (`target_account_id`, `weight`) |
+| `GET` | `/api/v1/privesc-path` | min-effort privilege-escalation path (`from`, `to` account ids) |
 
 ### Example
 
@@ -117,6 +121,37 @@ Path 1: web-dmz -> app-server -> db-core  (edges=2, max_risk=10)
 > The graph is **optional**: leave `AMANKAN_NEO4J_URI` empty (or stop Neo4j) and
 > the API/worker still run — graph endpoints just return `503`.
 
+### Privilege escalation (Account/Privilege graph + weighted Dijkstra)
+
+Beyond network hops, the graph models **principals and privilege**: `Account`
+nodes (per asset, at a privilege level) connected by weighted edges —
+`CAN_ESCALATE` (local priv-esc, intra-host) and `CREDENTIAL_REUSE` (lateral,
+inter-host). Edge weight = attacker effort; `apoc.algo.dijkstra` returns the
+**minimum-effort** escalation chain from a foothold to a privileged target.
+
+```bash
+make privesc         # builds accounts + escalation/reuse edges, queries the path
+```
+
+Example output (`scripts/privesc.sh`) — note Dijkstra rejects a cheaper-looking
+shortcut because the multi-step chain has lower total effort (7.5 < 10):
+
+```
+total attacker effort (cost) = 7.5  (5 steps)
+
+www-data@web-dmz [service]
+   | CAN_ESCALATE: DirtyPipe kernel LPE CWE-269 (weight 0.5)
+root@web-dmz [root]
+   | CREDENTIAL_REUSE (weight 3)
+appuser@app-srv [user]
+   | CAN_ESCALATE: sudo misconfiguration CWE-250 (weight 1)
+root@app-srv [root]
+   | CREDENTIAL_REUSE (weight 2)
+dba@db-core2 [admin]
+   | CAN_ESCALATE: DB superuser role grant CWE-269 (weight 1)
+dbroot@db-core2 [root]
+```
+
 ## Layout
 
 ```
@@ -136,7 +171,7 @@ internal/
 ```
 
 ## Next steps (toward the full platform)
-1. ~~Neo4j attack-path graph~~ ✅ done — extend with user-privilege nodes and `apoc` weighted shortest paths.
+1. ~~Neo4j attack-path graph + user-privilege nodes (apoc weighted Dijkstra)~~ ✅ done — next: auto-derive escalation/reuse edges from scan findings instead of manual seeding.
 2. Replace the Redis list with RabbitMQ + Kubernetes Jobs for isolated, scalable scans.
 3. Front with Keycloak (OAuth2/OIDC) and add the Next.js + Ant Design Pro dashboard.
 4. Sign + ship logs to immutable storage (BSSN forensic retention) and ELK.
