@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log"
 
+	"github.com/amankan/amankan/internal/compliance"
 	"github.com/amankan/amankan/internal/config"
 	"github.com/amankan/amankan/internal/graph"
 	"github.com/amankan/amankan/internal/normalize"
@@ -87,6 +88,15 @@ func (p *Processor) Process(ctx context.Context, scanJobID string) error {
 			if p.graph != nil {
 				if err := p.graph.SyncFinding(scanCtx, findings[i]); err != nil {
 					log.Printf("scan %s: graph sync finding error: %v", job.ID, err)
+				}
+				// A privilege-escalation weakness on this host automatically wires
+				// a CAN_ESCALATE (foothold -> root) edge into the privilege graph.
+				if compliance.IsPrivEsc(findings[i].CWE) {
+					if err := p.graph.AutoDeriveEscalation(scanCtx, asset.ID, findings[i].CWE, findings[i].Title, findings[i].RiskScore); err != nil {
+						log.Printf("scan %s: graph auto-escalation error: %v", job.ID, err)
+					} else {
+						log.Printf("scan %s: auto-derived CAN_ESCALATE on %s from %s (%s)", job.ID, asset.Name, findings[i].Title, findings[i].CWE)
+					}
 				}
 			}
 			total++

@@ -79,6 +79,36 @@ var catalog = map[string]entry{
 			},
 		},
 	},
+	"CWE-269": { // Improper privilege management (local privilege escalation)
+		owaspTop10: "A01:2021 Broken Access Control",
+		owaspASVS:  "ASVS V1.2 Authentication Architecture",
+		iso27001:   "A.8.2 Privileged access rights; A.8.18 Use of privileged utility programs",
+		bssn:       "Indeks KAMI - Pengelolaan Hak Akses",
+		cobit:      "DSS05 Manage Security Services",
+		remedy: models.RemediationGuide{
+			Summary: "Patch the privilege-escalation vector and tighten privilege boundaries.",
+			Steps: []string{
+				"Apply the vendor patch for the affected component (e.g. pkexec/polkit).",
+				"Enforce least privilege; remove unnecessary SUID/SGID binaries.",
+				"Audit local accounts and sudo rules.",
+			},
+			Refs: []string{"CVE-2021-4034 (PwnKit)", "OWASP Access Control Cheat Sheet"},
+		},
+	},
+	"CWE-250": { // Execution with unnecessary privileges
+		owaspTop10: "A04:2021 Insecure Design",
+		owaspASVS:  "ASVS V1.2 Authentication Architecture",
+		iso27001:   "A.8.2 Privileged access rights",
+		bssn:       "Indeks KAMI - Pengelolaan Hak Akses",
+		cobit:      "DSS05 Manage Security Services",
+		remedy: models.RemediationGuide{
+			Summary: "Drop unnecessary privileges and run services as least-privileged users.",
+			Steps: []string{
+				"Run services under dedicated low-privilege accounts.",
+				"Remove overly-permissive sudo/Administrator grants.",
+			},
+		},
+	},
 	// Open-port / service exposure findings from nmap are categorized as misconfig.
 	"CWE-1327": { // Binding to an unrestricted IP address (exposed service)
 		owaspTop10: "A05:2021 Security Misconfiguration",
@@ -133,6 +163,21 @@ func Remediation(cwe string) models.RemediationGuide {
 	}
 	return defaultEntry.remedy
 }
+
+// privEscCWEs are weaknesses whose presence on a host implies a local
+// privilege-escalation capability (used to auto-derive CAN_ESCALATE edges).
+var privEscCWEs = map[string]bool{
+	"CWE-269": true, // Improper Privilege Management
+	"CWE-250": true, // Execution with Unnecessary Privileges
+	"CWE-264": true, // Permissions, Privileges, and Access Controls
+	"CWE-276": true, // Incorrect Default Permissions
+	"CWE-732": true, // Incorrect Permission Assignment for Critical Resource
+	"CWE-862": true, // Missing Authorization
+	"CWE-863": true, // Incorrect Authorization
+}
+
+// IsPrivEsc reports whether a CWE indicates a local privilege-escalation vector.
+func IsPrivEsc(cwe string) bool { return privEscCWEs[cwe] }
 
 // CatalogCWEs lists the CWEs that have explicit mappings (for the /compliance API).
 func CatalogCWEs() []string {

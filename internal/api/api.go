@@ -57,6 +57,7 @@ func (a *API) Router() http.Handler {
 		r.Get("/assets/{id}/attack-paths", a.attackPaths) // ?min_risk= &max_hops=
 
 		// Privilege-escalation graph (accounts + weighted escalation/reuse edges).
+		r.Get("/assets/{id}/accounts", a.listAccounts)
 		r.Post("/accounts", a.createAccount)
 		r.Post("/accounts/{id}/escalation", a.addEscalation)
 		r.Post("/accounts/{id}/credential-reuse", a.addCredentialReuse)
@@ -326,6 +327,25 @@ func (a *API) attackPaths(w http.ResponseWriter, r *http.Request) {
 
 var validPrivileges = map[string]bool{
 	"user": true, "service": true, "admin": true, "root": true, "domain_admin": true,
+}
+
+// listAccounts returns the accounts (manual + auto-derived) attached to an asset.
+func (a *API) listAccounts(w http.ResponseWriter, r *http.Request) {
+	if a.graph == nil {
+		graphDisabled(w)
+		return
+	}
+	assetID := chi.URLParam(r, "id")
+	if _, err := a.store.GetAsset(r.Context(), assetID); err != nil {
+		notFoundOrError(w, err)
+		return
+	}
+	accounts, err := a.graph.ListAccounts(r.Context(), assetID)
+	if err != nil {
+		serverError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, accounts)
 }
 
 // createAccount registers a principal on an asset in the privilege graph.

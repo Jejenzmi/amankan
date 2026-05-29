@@ -34,3 +34,6 @@ attackpath:
 
 privesc:
 	./scripts/privesc.sh
+
+autoprivesc:
+	./scripts/autoprivesc.sh

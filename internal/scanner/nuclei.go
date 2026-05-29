@@ -41,5 +41,6 @@ func (n *Nuclei) Scan(ctx context.Context, asset models.Asset) (RawResult, error
 func mockNucleiJSONL(target string) []byte {
 	return []byte(`{"template-id":"git-config","info":{"name":"Git Configuration Exposure","severity":"medium","classification":{"cve-id":[],"cwe-id":["CWE-538"]}},"matched-at":"http://` + escapeAttr(target) + `/.git/config"}
 {"template-id":"missing-csp","info":{"name":"Missing Content-Security-Policy Header","severity":"low","classification":{"cve-id":[],"cwe-id":["CWE-693"]}},"matched-at":"http://` + escapeAttr(target) + `/"}
-{"template-id":"CVE-2021-44228","info":{"name":"Apache Log4j RCE (Log4Shell)","severity":"critical","classification":{"cve-id":["CVE-2021-44228"],"cwe-id":["CWE-502"]}},"matched-at":"http://` + escapeAttr(target) + `/api"}`)
+{"template-id":"CVE-2021-44228","info":{"name":"Apache Log4j RCE (Log4Shell)","severity":"critical","classification":{"cve-id":["CVE-2021-44228"],"cwe-id":["CWE-502"]}},"matched-at":"http://` + escapeAttr(target) + `/api"}
+{"template-id":"CVE-2021-4034","info":{"name":"Polkit pkexec Local Privilege Escalation (PwnKit)","severity":"high","classification":{"cve-id":["CVE-2021-4034"],"cwe-id":["CWE-269"]}},"matched-at":"` + escapeAttr(target) + `"}`)
 }

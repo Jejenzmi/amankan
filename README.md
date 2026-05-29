@@ -80,6 +80,7 @@ make smoke
 | `POST` | `/api/v1/accounts` | register a principal on an asset (`asset_id`, `username`, `privilege`) |
 | `POST` | `/api/v1/accounts/{id}/escalation` | local priv-esc edge (`target_account_id`, `technique`, `cwe`, `weight`) |
 | `POST` | `/api/v1/accounts/{id}/credential-reuse` | lateral credential-reuse edge (`target_account_id`, `weight`) |
+| `GET` | `/api/v1/assets/{id}/accounts` | accounts on an asset (manual + auto-derived) |
 | `GET` | `/api/v1/privesc-path` | min-effort privilege-escalation path (`from`, `to` account ids) |
 
 ### Example
@@ -152,6 +153,32 @@ dba@db-core2 [admin]
 dbroot@db-core2 [root]
 ```
 
+#### Auto-derived escalation edges (from scan findings)
+
+`CAN_ESCALATE` edges form **automatically from scans** — no manual seeding. When
+a scan produces a privilege-escalation finding (a priv-esc CWE such as `CWE-269`
+PwnKit / `CWE-250`), Amankan ensures a `foothold (user)` and `root` account on
+that host and wires a `foothold -> root` escalation edge, weighted from the
+finding's `risk_score` (higher risk → lower effort). Only cross-host
+`CREDENTIAL_REUSE` stays explicit (host-to-host trust isn't observable from
+scanning one host).
+
+```bash
+make autoprivesc     # scans 2 hosts, escalation edges appear by themselves
+```
+
+```
+total attacker effort (cost) = 3.6  (3 steps)
+
+foothold@web-edge [user]
+   | CAN_ESCALATE: PwnKit CWE-269 (weight 0.3) (auto-derived from scan)
+root@web-edge [root]
+   | CREDENTIAL_REUSE (weight 3) (manual)
+foothold@db-vault [user]
+   | CAN_ESCALATE: PwnKit CWE-269 (weight 0.3) (auto-derived from scan)
+root@db-vault [root]
+```
+
 ## Layout
 
 ```
@@ -171,7 +198,7 @@ internal/
 ```
 
 ## Next steps (toward the full platform)
-1. ~~Neo4j attack-path graph + user-privilege nodes (apoc weighted Dijkstra)~~ ✅ done — next: auto-derive escalation/reuse edges from scan findings instead of manual seeding.
+1. ~~Neo4j attack-path graph + user-privilege nodes (apoc weighted Dijkstra) + auto-derived escalation edges from scan findings~~ ✅ done — next: infer credential-reuse edges from shared service accounts / harvested secrets instead of manual seeding.
 2. Replace the Redis list with RabbitMQ + Kubernetes Jobs for isolated, scalable scans.
 3. Front with Keycloak (OAuth2/OIDC) and add the Next.js + Ant Design Pro dashboard.
 4. Sign + ship logs to immutable storage (BSSN forensic retention) and ELK.

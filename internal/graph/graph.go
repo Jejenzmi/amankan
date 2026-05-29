@@ -137,6 +137,73 @@ func (g *Graph) UpsertCredentialReuse(ctx context.Context, fromID, toID string, 
 	return g.edge(ctx, "CREDENTIAL_REUSE", fromID, toID, map[string]any{"weight": weight})
 }
 
+// AutoEscalationWeight maps a finding's risk score to attacker effort: the more
+// dangerous (higher risk) the priv-esc vuln, the cheaper (lower weight) the
+// escalation edge. Clamped to [0.3, 9].
+func AutoEscalationWeight(risk float64) float64 {
+	w := 10 - risk
+	if w < 0.3 {
+		w = 0.3
+	}
+	if w > 9 {
+		w = 9
+	}
+	return round2(w)
+}
+
+// AutoDeriveEscalation turns a privilege-escalation finding into graph capability
+// automatically: it ensures a foothold (low-priv) and root (high-priv) account
+// exist on the asset and links them with a CAN_ESCALATE edge whose weight comes
+// from the finding's risk score. Idempotent — accounts use deterministic IDs and
+// the edge keeps the cheapest (lowest-weight) enabling vuln across re-scans.
+func (g *Graph) AutoDeriveEscalation(ctx context.Context, assetID, cwe, technique string, risk float64) error {
+	weight := AutoEscalationWeight(risk)
+	return g.write(ctx,
+		`MATCH (asset:Asset {id:$assetId})
+		 MERGE (low:Account {id:$footholdId})
+		   ON CREATE SET low.username='foothold', low.privilege='user', low.asset_id=$assetId, low.auto=true
+		 MERGE (high:Account {id:$rootId})
+		   ON CREATE SET high.username='root', high.privilege='root', high.asset_id=$assetId, high.auto=true
+		 MERGE (asset)-[:HAS_ACCOUNT]->(low)
+		 MERGE (asset)-[:HAS_ACCOUNT]->(high)
+		 MERGE (low)-[r:CAN_ESCALATE]->(high)
+		   ON CREATE SET r.auto=true, r.weight=$weight, r.technique=$technique, r.cwe=$cwe, r.risk=$risk
+		 WITH r
+		 WHERE r.weight > $weight
+		 SET r.technique=$technique, r.cwe=$cwe, r.risk=$risk, r.weight=$weight`,
+		map[string]any{
+			"assetId":    assetID,
+			"footholdId": AutoAccountID(assetID, "foothold"),
+			"rootId":     AutoAccountID(assetID, "root"),
+			"weight":     weight, "technique": technique, "cwe": cwe, "risk": risk,
+		})
+}
+
+// AutoAccountID returns the deterministic node id for an auto-derived account so
+// re-scans stay idempotent and callers can address them without a lookup.
+func AutoAccountID(assetID, role string) string { return "auto-" + role + "-" + assetID }
+
+// ListAccounts returns the accounts attached to an asset.
+func (g *Graph) ListAccounts(ctx context.Context, assetID string) ([]Account, error) {
+	recs, err := g.read(ctx,
+		`MATCH (asset:Asset {id:$assetId})-[:HAS_ACCOUNT]->(acc:Account)
+		 RETURN acc.id AS id, acc.username AS username, acc.privilege AS privilege, acc.asset_id AS asset_id
+		 ORDER BY acc.privilege`,
+		map[string]any{"assetId": assetID})
+	if err != nil {
+		return nil, err
+	}
+	out := make([]Account, 0, len(recs))
+	for _, r := range recs {
+		id, _ := r.Get("id")
+		u, _ := r.Get("username")
+		p, _ := r.Get("privilege")
+		aid, _ := r.Get("asset_id")
+		out = append(out, Account{ID: toStr(id), Username: toStr(u), Privilege: toStr(p), AssetID: toStr(aid)})
+	}
+	return out, nil
+}
+
 // edge upserts a typed relationship between two accounts, returning whether both
 // endpoints existed (and the edge was therefore created/updated).
 func (g *Graph) edge(ctx context.Context, relType, fromID, toID string, props map[string]any) (bool, error) {

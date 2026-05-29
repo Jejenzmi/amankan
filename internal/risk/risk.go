@@ -13,6 +13,7 @@ import (
 // here get a threat multiplier because they are exploited in the wild.
 var knownExploited = map[string]bool{
 	"CVE-2021-44228": true, // Log4Shell
+	"CVE-2021-4034":  true, // PwnKit (polkit pkexec LPE)
 	"CVE-2017-0144":  true, // EternalBlue
 	"CVE-2014-0160":  true, // Heartbleed
 }
