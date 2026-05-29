@@ -2,8 +2,10 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"strconv"
 	"time"
@@ -53,6 +55,8 @@ func (a *API) Router() http.Handler {
 
 		// Graph Analysis Engine (attack paths / lateral movement).
 		r.Post("/graph/sync", a.graphSync)
+		r.Post("/graph/topology", a.importTopology) // bulk CAN_REACH import (CMDB feed)
+		r.Get("/graph/export", a.exportGraph)       // full graph for visualization
 		r.Post("/assets/{id}/reachability", a.addReachability)
 		r.Get("/assets/{id}/attack-paths", a.attackPaths) // ?min_risk= &max_hops=
 
@@ -244,6 +248,77 @@ func (a *API) graphSync(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	writeJSON(w, http.StatusOK, map[string]int{"assets": syncedAssets, "vulnerabilities": syncedVulns})
+}
+
+// importTopology bulk-loads CAN_REACH edges from a CMDB / topology feed. Each
+// edge references assets by UUID or by target (IP/domain), so an inventory export
+// can be ingested directly without knowing Amankan's internal ids.
+func (a *API) importTopology(w http.ResponseWriter, r *http.Request) {
+	if a.graph == nil {
+		graphDisabled(w)
+		return
+	}
+	var in struct {
+		Edges []struct {
+			From  string `json:"from"` // asset id or target
+			To    string `json:"to"`   // asset id or target
+			Port  int    `json:"port"`
+			Proto string `json:"proto"`
+		} `json:"edges"`
+	}
+	if err := decode(r, &in); err != nil {
+		badRequest(w, err.Error())
+		return
+	}
+	imported := 0
+	var problems []string
+	for i, e := range in.Edges {
+		src, err := a.resolveAsset(r.Context(), e.From)
+		if err != nil {
+			problems = append(problems, fmt.Sprintf("edge %d: from %q not found", i, e.From))
+			continue
+		}
+		dst, err := a.resolveAsset(r.Context(), e.To)
+		if err != nil {
+			problems = append(problems, fmt.Sprintf("edge %d: to %q not found", i, e.To))
+			continue
+		}
+		// Project both endpoints so CAN_REACH attaches even before either is scanned.
+		_ = a.graph.SyncAsset(r.Context(), *src)
+		_ = a.graph.SyncAsset(r.Context(), *dst)
+		proto := e.Proto
+		if proto == "" {
+			proto = "tcp"
+		}
+		if err := a.graph.UpsertReachability(r.Context(), src.ID, dst.ID, e.Port, proto); err != nil {
+			serverError(w, err)
+			return
+		}
+		imported++
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"imported": imported, "problems": problems})
+}
+
+// resolveAsset resolves an asset reference that may be a UUID or a target string.
+func (a *API) resolveAsset(ctx context.Context, ref string) (*models.Asset, error) {
+	if asset, err := a.store.GetAsset(ctx, ref); err == nil {
+		return asset, nil
+	}
+	return a.store.GetAssetByTarget(ctx, ref)
+}
+
+// exportGraph returns the full attack graph (nodes + edges) for visualization.
+func (a *API) exportGraph(w http.ResponseWriter, r *http.Request) {
+	if a.graph == nil {
+		graphDisabled(w)
+		return
+	}
+	g, err := a.graph.ExportGraph(r.Context())
+	if err != nil {
+		serverError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, g)
 }
 
 // addReachability records a network reachability edge (source -> destination),

@@ -51,6 +51,21 @@ func (s *Store) GetAsset(ctx context.Context, id string) (*models.Asset, error) 
 	return &a, nil
 }
 
+// GetAssetByTarget resolves an asset by its target (IP/domain/repo). Used by the
+// CMDB/topology import to reference assets by address instead of UUID.
+func (s *Store) GetAssetByTarget(ctx context.Context, target string) (*models.Asset, error) {
+	row := s.pool.QueryRow(ctx,
+		`SELECT id,name,type,target,criticality,tags,created_at FROM assets WHERE target=$1 LIMIT 1`, target)
+	var a models.Asset
+	if err := row.Scan(&a.ID, &a.Name, &a.Type, &a.Target, &a.Criticality, &a.Tags, &a.CreatedAt); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, ErrNotFound
+		}
+		return nil, err
+	}
+	return &a, nil
+}
+
 func (s *Store) ListAssets(ctx context.Context) ([]models.Asset, error) {
 	rows, err := s.pool.Query(ctx,
 		`SELECT id,name,type,target,criticality,tags,created_at FROM assets ORDER BY created_at DESC`)

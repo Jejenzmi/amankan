@@ -480,6 +480,98 @@ func (g *Graph) FindAttackPaths(ctx context.Context, targetID string, minRisk fl
 	return paths, nil
 }
 
+// ---- graph export (for visualization) ----
+
+// ExportNode is a node in the visualization export.
+type ExportNode struct {
+	ID          string  `json:"id"`
+	Type        string  `json:"type"` // Asset | Account | Credential | Vulnerability
+	Label       string  `json:"label"`
+	Criticality string  `json:"criticality,omitempty"`
+	Exposure    string  `json:"exposure,omitempty"`
+	Privilege   string  `json:"privilege,omitempty"`
+	Severity    string  `json:"severity,omitempty"`
+	Risk        float64 `json:"risk,omitempty"`
+}
+
+// ExportEdge is a relationship in the visualization export.
+type ExportEdge struct {
+	Type      string  `json:"type"`
+	Source    string  `json:"source"`
+	Target    string  `json:"target"`
+	Weight    float64 `json:"weight,omitempty"`
+	Technique string  `json:"technique,omitempty"`
+	CWE       string  `json:"cwe,omitempty"`
+	Via       string  `json:"via,omitempty"`
+	Port      int     `json:"port,omitempty"`
+}
+
+// GraphExport is the full graph for the dashboard.
+type GraphExport struct {
+	Nodes []ExportNode `json:"nodes"`
+	Edges []ExportEdge `json:"edges"`
+}
+
+// ExportGraph returns all asset/account/credential/vulnerability nodes and the
+// relationships among them, for the dashboard's attack-graph visualization.
+func (g *Graph) ExportGraph(ctx context.Context) (GraphExport, error) {
+	out := GraphExport{Nodes: []ExportNode{}, Edges: []ExportEdge{}}
+
+	nodeRecs, err := g.read(ctx,
+		`MATCH (n)
+		 WHERE n:Asset OR n:Account OR n:Credential OR n:Vulnerability
+		 RETURN labels(n)[0] AS type,
+		        coalesce(n.id, n.fingerprint) AS id,
+		        coalesce(n.name, n.username, n.principal, n.title) AS label,
+		        n.criticality AS criticality, n.exposure AS exposure,
+		        n.privilege AS privilege, n.severity AS severity, n.risk AS risk`, nil)
+	if err != nil {
+		return out, err
+	}
+	for _, r := range nodeRecs {
+		t, _ := r.Get("type")
+		id, _ := r.Get("id")
+		label, _ := r.Get("label")
+		crit, _ := r.Get("criticality")
+		exp, _ := r.Get("exposure")
+		priv, _ := r.Get("privilege")
+		sev, _ := r.Get("severity")
+		risk, _ := r.Get("risk")
+		out.Nodes = append(out.Nodes, ExportNode{
+			ID: toStr(id), Type: toStr(t), Label: toStr(label),
+			Criticality: toStr(crit), Exposure: toStr(exp), Privilege: toStr(priv),
+			Severity: toStr(sev), Risk: toFloat(risk),
+		})
+	}
+
+	edgeRecs, err := g.read(ctx,
+		`MATCH (a)-[r]->(b)
+		 WHERE (a:Asset OR a:Account OR a:Credential OR a:Vulnerability)
+		   AND (b:Asset OR b:Account OR b:Credential OR b:Vulnerability)
+		 RETURN type(r) AS type,
+		        coalesce(a.id, a.fingerprint) AS source,
+		        coalesce(b.id, b.fingerprint) AS target,
+		        r.weight AS weight, r.technique AS technique, r.cwe AS cwe, r.via AS via, r.port AS port`, nil)
+	if err != nil {
+		return out, err
+	}
+	for _, r := range edgeRecs {
+		t, _ := r.Get("type")
+		src, _ := r.Get("source")
+		dst, _ := r.Get("target")
+		w, _ := r.Get("weight")
+		tech, _ := r.Get("technique")
+		cwe, _ := r.Get("cwe")
+		via, _ := r.Get("via")
+		port, _ := r.Get("port")
+		out.Edges = append(out.Edges, ExportEdge{
+			Type: toStr(t), Source: toStr(src), Target: toStr(dst),
+			Weight: toFloat(w), Technique: toStr(tech), CWE: toStr(cwe), Via: toStr(via), Port: toInt(port),
+		})
+	}
+	return out, nil
+}
+
 // ---- low-level helpers ----
 
 func (g *Graph) write(ctx context.Context, cypher string, params map[string]any) error {

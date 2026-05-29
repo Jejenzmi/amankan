@@ -75,6 +75,8 @@ make smoke
 | `PATCH` | `/api/v1/findings/{id}/status` | validate / mark false-positive / remediated |
 | `GET` | `/api/v1/compliance/cwe/{cwe}` | governance mapping + remediation for a CWE |
 | `POST` | `/api/v1/graph/sync` | (re)project all assets + findings into Neo4j |
+| `POST` | `/api/v1/graph/topology` | bulk-import `CAN_REACH` edges from a CMDB/topology feed (`edges[]`, assets by id or target) |
+| `GET` | `/api/v1/graph/export` | full attack graph (nodes + edges) for visualization |
 | `POST` | `/api/v1/assets/{id}/reachability` | add a reachability edge (`target_id`, `port`) — a lateral-movement hop |
 | `GET` | `/api/v1/assets/{id}/attack-paths` | attack paths leading to this asset (`min_risk`, `max_hops`) |
 | `POST` | `/api/v1/accounts` | register a principal on an asset (`asset_id`, `username`, `privilege`) |
@@ -205,9 +207,13 @@ foothold@db-crown [user]
 root@db-crown [root]
 ```
 
-> **Scope boundary:** the *privilege* layer (escalation + credential reuse) is
-> fully derived from scan findings. Network `CAN_REACH` edges remain a topology
-> input — host-to-host reachability is not observable from scanning a single host.
+> **Network layer.** `CAN_REACH` edges are populated two ways, both without
+> per-edge hand-wiring: (1) **CMDB/topology import** — `POST /graph/topology`
+> bulk-loads edges from an inventory feed (assets referenced by id or target);
+> (2) **subnet derivation** — scanning a private IP asset auto-creates host-level
+> `CAN_REACH` to other assets in the same `/24` (a stand-in for internal
+> network-discovery). Full arbitrary topology still comes from the CMDB feed,
+> since cross-subnet reachability isn't observable from one host's scan.
 
 ## Layout
 

@@ -6,10 +6,13 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"net"
+	"strings"
 
 	"github.com/amankan/amankan/internal/compliance"
 	"github.com/amankan/amankan/internal/config"
 	"github.com/amankan/amankan/internal/graph"
+	"github.com/amankan/amankan/internal/models"
 	"github.com/amankan/amankan/internal/normalize"
 	"github.com/amankan/amankan/internal/scanner"
 	"github.com/amankan/amankan/internal/store"
@@ -112,9 +115,61 @@ func (p *Processor) Process(ctx context.Context, scanJobID string) error {
 		}
 	}
 
+	// Derive network reachability (CAN_REACH) to same-subnet peers — a stand-in
+	// for an internal network-discovery scan. Honest scope: this only infers
+	// host-level L3 reachability within a shared private /24, not the full
+	// topology (which would come from a CMDB feed via POST /graph/topology).
+	if p.graph != nil && asset.Type == models.AssetIP {
+		if n := p.deriveSubnetReachability(scanCtx, *asset); n > 0 {
+			log.Printf("scan %s: derived CAN_REACH to %d same-subnet peer(s) of %s", job.ID, n, asset.Name)
+		}
+	}
+
 	if err := p.store.MarkCompleted(ctx, job.ID, usedMock); err != nil {
 		return err
 	}
 	log.Printf("scan %s: completed, %d findings persisted (mock=%v)", job.ID, total, usedMock)
 	return nil
+}
+
+// deriveSubnetReachability creates bidirectional CAN_REACH edges between an IP
+// asset and other IP assets sharing its private /24, returning the peer count.
+func (p *Processor) deriveSubnetReachability(ctx context.Context, asset models.Asset) int {
+	assets, err := p.store.ListAssets(ctx)
+	if err != nil {
+		log.Printf("subnet derivation: list assets: %v", err)
+		return 0
+	}
+	net, ok := privateSubnet24(asset.Target)
+	if !ok {
+		return 0
+	}
+	count := 0
+	for _, peer := range assets {
+		if peer.ID == asset.ID || peer.Type != models.AssetIP {
+			continue
+		}
+		pnet, ok := privateSubnet24(peer.Target)
+		if !ok || pnet != net {
+			continue
+		}
+		_ = p.graph.UpsertReachability(ctx, asset.ID, peer.ID, 0, "ip")
+		_ = p.graph.UpsertReachability(ctx, peer.ID, asset.ID, 0, "ip")
+		count++
+	}
+	return count
+}
+
+// privateSubnet24 returns the /24 prefix (e.g. "10.0.1") of a private IPv4
+// target, and whether the target is a private IPv4 address.
+func privateSubnet24(target string) (string, bool) {
+	ip := net.ParseIP(strings.TrimSpace(target))
+	if ip == nil {
+		return "", false
+	}
+	v4 := ip.To4()
+	if v4 == nil || !ip.IsPrivate() {
+		return "", false
+	}
+	return fmt.Sprintf("%d.%d.%d", v4[0], v4[1], v4[2]), true
 }
