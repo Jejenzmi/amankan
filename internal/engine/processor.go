@@ -98,6 +98,15 @@ func (p *Processor) Process(ctx context.Context, scanJobID string) error {
 						log.Printf("scan %s: auto-derived CAN_ESCALATE on %s from %s (%s)", job.ID, asset.Name, findings[i].Title, findings[i].CWE)
 					}
 				}
+				// A leaked/shared credential automatically wires CREDENTIAL_REUSE
+				// edges to every other host exposing the same credential.
+				if compliance.IsCredentialLeak(findings[i].CWE) && findings[i].CredFP != "" {
+					if n, err := p.graph.AutoDeriveCredentialReuse(scanCtx, asset.ID, findings[i].Principal, findings[i].CredFP, findings[i].Title, findings[i].RiskScore); err != nil {
+						log.Printf("scan %s: graph auto-credential-reuse error: %v", job.ID, err)
+					} else {
+						log.Printf("scan %s: auto-derived CREDENTIAL_REUSE for %q on %s (%d lateral edges total)", job.ID, findings[i].Principal, asset.Name, n)
+					}
+				}
 			}
 			total++
 		}

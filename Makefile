@@ -37,3 +37,6 @@ privesc:
 
 autoprivesc:
 	./scripts/autoprivesc.sh
+
+autograph:
+	./scripts/autograph.sh

@@ -45,6 +45,7 @@ func (g *Graph) ensureConstraints(ctx context.Context) error {
 		"CREATE CONSTRAINT asset_id IF NOT EXISTS FOR (a:Asset) REQUIRE a.id IS UNIQUE",
 		"CREATE CONSTRAINT vuln_id IF NOT EXISTS FOR (v:Vulnerability) REQUIRE v.id IS UNIQUE",
 		"CREATE CONSTRAINT account_id IF NOT EXISTS FOR (acc:Account) REQUIRE acc.id IS UNIQUE",
+		"CREATE CONSTRAINT credential_fp IF NOT EXISTS FOR (c:Credential) REQUIRE c.fingerprint IS UNIQUE",
 	}
 	for _, s := range stmts {
 		if err := g.write(ctx, s, nil); err != nil {
@@ -182,6 +183,72 @@ func (g *Graph) AutoDeriveEscalation(ctx context.Context, assetID, cwe, techniqu
 // AutoAccountID returns the deterministic node id for an auto-derived account so
 // re-scans stay idempotent and callers can address them without a lookup.
 func AutoAccountID(assetID, role string) string { return "auto-" + role + "-" + assetID }
+
+// AutoReuseWeight maps a credential-exposure finding's risk to lateral-movement
+// effort: a more severe leak makes credential reuse cheaper. Clamped to [1, 9].
+func AutoReuseWeight(risk float64) float64 {
+	w := 11 - risk
+	if w < 1 {
+		w = 1
+	}
+	if w > 9 {
+		w = 9
+	}
+	return round2(w)
+}
+
+// AutoDeriveCredentialReuse turns a hard-coded-credential finding (CWE-798) into
+// lateral-movement capability automatically. It records that the host's root can
+// read a shared credential (CAN_READ) and that the credential authenticates as a
+// local user on this host (VALID_ON its foothold), then materializes
+// CREDENTIAL_REUSE edges between every pair of hosts that expose the SAME
+// credential fingerprint: root@X -> foothold@Y. No manual seeding required.
+func (g *Graph) AutoDeriveCredentialReuse(ctx context.Context, assetID, principal, fp, technique string, risk float64) (int, error) {
+	weight := AutoReuseWeight(risk)
+
+	// 1) Record provenance for this host: root can read the secret; the
+	//    credential is valid as a local user (foothold) here.
+	if err := g.write(ctx,
+		`MATCH (asset:Asset {id:$assetId})
+		 MERGE (low:Account {id:$footholdId})
+		   ON CREATE SET low.username='foothold', low.privilege='user', low.asset_id=$assetId, low.auto=true
+		 MERGE (high:Account {id:$rootId})
+		   ON CREATE SET high.username='root', high.privilege='root', high.asset_id=$assetId, high.auto=true
+		 MERGE (asset)-[:HAS_ACCOUNT]->(low)
+		 MERGE (asset)-[:HAS_ACCOUNT]->(high)
+		 MERGE (c:Credential {fingerprint:$fp})
+		   ON CREATE SET c.principal=$principal
+		 MERGE (high)-[cr:CAN_READ]->(c) SET cr.technique=$technique
+		 MERGE (c)-[:VALID_ON]->(low)`,
+		map[string]any{
+			"assetId":    assetID,
+			"footholdId": AutoAccountID(assetID, "foothold"),
+			"rootId":     AutoAccountID(assetID, "root"),
+			"fp":         fp, "principal": principal, "technique": technique,
+		}); err != nil {
+		return 0, err
+	}
+
+	// 2) Infer credential reuse across hosts sharing this fingerprint:
+	//    compromising root on one host lets the attacker authenticate as a user
+	//    on the others. Returns how many lateral edges now exist for this credential.
+	recs, err := g.writeReturn(ctx,
+		`MATCH (rx:Account)-[:CAN_READ]->(c:Credential {fingerprint:$fp})-[:VALID_ON]->(fy:Account)
+		 WHERE rx.asset_id <> fy.asset_id
+		 MERGE (rx)-[r:CREDENTIAL_REUSE]->(fy)
+		   ON CREATE SET r.auto=true, r.weight=$weight, r.principal=c.principal,
+		                 r.via=('shared credential: '+c.principal)
+		 RETURN count(r) AS c`,
+		map[string]any{"fp": fp, "weight": weight})
+	if err != nil {
+		return 0, err
+	}
+	if len(recs) == 0 {
+		return 0, nil
+	}
+	c, _ := recs[0].Get("c")
+	return toInt(c), nil
+}
 
 // ListAccounts returns the accounts attached to an asset.
 func (g *Graph) ListAccounts(ctx context.Context, assetID string) ([]Account, error) {

@@ -109,6 +109,22 @@ var catalog = map[string]entry{
 			},
 		},
 	},
+	"CWE-798": { // Use of hard-coded credentials
+		owaspTop10: "A07:2021 Identification and Authentication Failures",
+		owaspASVS:  "ASVS V2.10 Service Authentication; V6.4 Secret Management",
+		iso27001:   "A.8.24 Use of cryptography; A.5.17 Authentication information",
+		bssn:       "Indeks KAMI - Pengelolaan Kredensial",
+		cobit:      "DSS05 Manage Security Services",
+		remedy: models.RemediationGuide{
+			Summary: "Remove hard-coded credentials and rotate the exposed secret.",
+			Steps: []string{
+				"Move secrets to a vault / secret manager; remove from code and config.",
+				"Rotate the exposed credential immediately on every system it grants access to.",
+				"Scope service accounts per-host to prevent credential reuse / lateral movement.",
+			},
+			Refs: []string{"OWASP Secrets Management Cheat Sheet"},
+		},
+	},
 	// Open-port / service exposure findings from nmap are categorized as misconfig.
 	"CWE-1327": { // Binding to an unrestricted IP address (exposed service)
 		owaspTop10: "A05:2021 Security Misconfiguration",
@@ -178,6 +194,17 @@ var privEscCWEs = map[string]bool{
 
 // IsPrivEsc reports whether a CWE indicates a local privilege-escalation vector.
 func IsPrivEsc(cwe string) bool { return privEscCWEs[cwe] }
+
+// credentialLeakCWEs are weaknesses that expose reusable credentials, enabling
+// lateral movement via credential reuse (used to auto-derive CREDENTIAL_REUSE).
+var credentialLeakCWEs = map[string]bool{
+	"CWE-798": true, // Use of Hard-coded Credentials
+	"CWE-522": true, // Insufficiently Protected Credentials
+	"CWE-259": true, // Use of Hard-coded Password
+}
+
+// IsCredentialLeak reports whether a CWE exposes a reusable credential.
+func IsCredentialLeak(cwe string) bool { return credentialLeakCWEs[cwe] }
 
 // CatalogCWEs lists the CWEs that have explicit mappings (for the /compliance API).
 func CatalogCWEs() []string {

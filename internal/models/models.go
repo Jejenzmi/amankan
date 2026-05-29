@@ -48,9 +48,10 @@ const (
 type ScannerType string
 
 const (
-	ScannerNmap   ScannerType = "nmap"
-	ScannerNuclei ScannerType = "nuclei"
-	ScannerCrypto ScannerType = "crypto" // TLS/cipher audit (BSSN-ready)
+	ScannerNmap    ScannerType = "nmap"
+	ScannerNuclei  ScannerType = "nuclei"
+	ScannerCrypto  ScannerType = "crypto"  // TLS/cipher audit (BSSN-ready)
+	ScannerSecrets ScannerType = "secrets" // SAST-style hard-coded credential detection
 )
 
 // ScanStatus tracks lifecycle of an orchestrated scan job.
@@ -121,6 +122,12 @@ type Finding struct {
 	KnownExploit bool             `json:"known_exploit"`
 	Compliance  []ComplianceRef   `json:"compliance,omitempty"`
 	Remediation *RemediationGuide `json:"remediation,omitempty"`
+
+	// Transient scan-time metadata for credential findings (CWE-798). Populated
+	// by the normalizer and consumed by the graph engine to infer credential
+	// reuse; NOT persisted to PostgreSQL (only meaningful at scan time).
+	Principal string `json:"principal,omitempty"`
+	CredFP    string `json:"cred_fp,omitempty"`
 
 	CreatedAt time.Time `json:"created_at"`
 }

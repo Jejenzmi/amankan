@@ -26,6 +26,8 @@ func Normalize(raw scanner.RawResult, asset models.Asset, scanJobID string) ([]m
 		findings, err = parseNuclei(raw.Data, asset)
 	case "crypto-json":
 		findings, err = parseCrypto(raw.Data, asset)
+	case "secrets-json":
+		findings, err = parseSecrets(raw.Data, asset)
 	default:
 		return nil, fmt.Errorf("unknown format %q", raw.Format)
 	}
@@ -199,6 +201,39 @@ func parseCrypto(data []byte, asset models.Asset) ([]models.Finding, error) {
 			Service:  "https",
 			Port:     443,
 			Evidence: rep.Note,
+		})
+	}
+	return out, nil
+}
+
+// ---- secrets (SAST hard-coded credentials) ----
+
+type secretsReport struct {
+	Credentials []struct {
+		Principal   string `json:"principal"`
+		Fingerprint string `json:"fingerprint"`
+		Type        string `json:"type"`
+		Location    string `json:"location"`
+	} `json:"credentials"`
+}
+
+func parseSecrets(data []byte, asset models.Asset) ([]models.Finding, error) {
+	var rep secretsReport
+	if err := json.Unmarshal(data, &rep); err != nil {
+		return nil, fmt.Errorf("parse secrets report: %w", err)
+	}
+	var out []models.Finding
+	for _, c := range rep.Credentials {
+		out = append(out, models.Finding{
+			Title:    fmt.Sprintf("Hard-coded credential for %q", c.Principal),
+			Desc:     fmt.Sprintf("%s credential found at %s (fingerprint %s)", c.Type, c.Location, c.Fingerprint),
+			Severity: models.SevHigh,
+			CVSS:     8.2,
+			CWE:      "CWE-798",
+			Evidence: c.Location,
+			// Transient: drives credential-reuse inference in the graph engine.
+			Principal: c.Principal,
+			CredFP:    c.Fingerprint,
 		})
 	}
 	return out, nil

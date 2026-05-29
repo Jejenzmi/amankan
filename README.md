@@ -14,7 +14,7 @@ RabbitMQ, ELK) are out of scope for Phase 1 and noted as integration seams.
 | Design component | Phase 1 implementation |
 | --- | --- |
 | Orchestrator Service | Redis queue + worker process (`cmd/worker`) |
-| Scanner integration | `nmap` (real), `nuclei` (real), TLS crypto audit — each with a safe **mock fallback** |
+| Scanner integration | `nmap` (real), `nuclei` (real), TLS crypto audit, secrets/SAST (hard-coded credentials) — each with a safe **mock fallback** |
 | Normalization Engine | `internal/normalize` → one internal `Finding` schema |
 | Prioritization | `internal/risk`: CVSS × asset criticality × threat-intel (KEV-style) |
 | Compliance Policy Engine | `internal/compliance`: CWE → OWASP Top10/ASVS → ISO 27001 → BSSN/Indeks KAMI → COBIT |
@@ -179,6 +179,36 @@ foothold@db-vault [user]
 root@db-vault [root]
 ```
 
+#### Auto-derived credential-reuse edges (fully self-formed graph)
+
+The lateral `CREDENTIAL_REUSE` edges also form from scans. A hard-coded-credential
+finding (`CWE-798`) reveals a credential with a **fingerprint**; when the *same
+fingerprint* surfaces on multiple hosts (a shared service account), Amankan
+infers that compromising `root` on one host lets the attacker authenticate as a
+`user` on the others, and wires `root@X -> foothold@Y` automatically. Combined
+with auto-escalation, the **entire privilege attack graph forms from scans with
+zero manual edges**:
+
+```bash
+make autograph       # scans 2 hosts; full priv-esc path appears with NO manual edges
+```
+
+```
+total attacker effort (cost) = 1.6  (3 steps)
+
+foothold@web-gw [user]
+   | CAN_ESCALATE: PwnKit CWE-269 (weight 0.3)        [auto-derived]
+root@web-gw [root]
+   | CREDENTIAL_REUSE: shared credential (weight 1)   [auto-derived]
+foothold@db-crown [user]
+   | CAN_ESCALATE: PwnKit CWE-269 (weight 0.3)        [auto-derived]
+root@db-crown [root]
+```
+
+> **Scope boundary:** the *privilege* layer (escalation + credential reuse) is
+> fully derived from scan findings. Network `CAN_REACH` edges remain a topology
+> input — host-to-host reachability is not observable from scanning a single host.
+
 ## Layout
 
 ```
@@ -198,7 +228,7 @@ internal/
 ```
 
 ## Next steps (toward the full platform)
-1. ~~Neo4j attack-path graph + user-privilege nodes (apoc weighted Dijkstra) + auto-derived escalation edges from scan findings~~ ✅ done — next: infer credential-reuse edges from shared service accounts / harvested secrets instead of manual seeding.
+1. ~~Neo4j attack graph: network paths + privilege nodes (apoc Dijkstra) + auto-derived escalation **and** credential-reuse edges from scan findings~~ ✅ done — privilege layer is fully self-forming. Next: infer network `CAN_REACH` from a topology/CMDB feed so the network layer is automated too.
 2. Replace the Redis list with RabbitMQ + Kubernetes Jobs for isolated, scalable scans.
 3. Front with Keycloak (OAuth2/OIDC) and add the Next.js + Ant Design Pro dashboard.
 4. Sign + ship logs to immutable storage (BSSN forensic retention) and ELK.

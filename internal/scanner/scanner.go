@@ -41,7 +41,7 @@ func ForProfile(p models.ScanProfile, opts Options) []Scanner {
 	case models.ProfileWeb:
 		return []Scanner{NewNuclei(opts)}
 	case models.ProfileCritical:
-		return []Scanner{NewNmap(opts), NewNuclei(opts), NewCrypto(opts)}
+		return []Scanner{NewNmap(opts), NewNuclei(opts), NewCrypto(opts), NewSecrets(opts)}
 	default:
 		return []Scanner{NewNmap(opts)}
 	}
