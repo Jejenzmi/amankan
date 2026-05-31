@@ -251,8 +251,11 @@ npm install
 npm run dev        # http://localhost:3000  (expects the API on :8080)
 ```
 
-> The API serves permissive CORS for local development (`internal/api`).
-> Point the dashboard elsewhere with `NEXT_PUBLIC_API_BASE`.
+> Point the dashboard at the API with `NEXT_PUBLIC_API_BASE`. For **Keycloak SSO**
+> set `NEXT_PUBLIC_OIDC_ISSUER` + `NEXT_PUBLIC_OIDC_CLIENT_ID` (Authorization
+> Code + PKCE login is built in, with a `/callback` route and sign-in/out); the
+> obtained token is sent as the API bearer. Without OIDC, set
+> `NEXT_PUBLIC_API_KEY` to use API-key auth.
 >
 > **Node version matters:** the `@next/swc` native compiler deadlocks on Node 25,
 > so `next build`/`next dev` hang at "Creating an optimized production build".

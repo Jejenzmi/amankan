@@ -1,9 +1,18 @@
 "use client";
 import { usePathname } from "next/navigation";
 import Link from "next/link";
+import { useEffect, useState } from "react";
+import { oidcEnabled, isAuthenticated, login, logout } from "@/lib/oidc";
 
 export default function TopBar() {
   const path = usePathname();
+  const [authed, setAuthed] = useState(false);
+
+  // OIDC state is client-only (localStorage); resolve after mount.
+  useEffect(() => {
+    setAuthed(oidcEnabled() && isAuthenticated());
+  }, []);
+
   return (
     <div className="topbar">
       <div className="brand">
@@ -23,8 +32,20 @@ export default function TopBar() {
           Attack Graph
         </Link>
       </nav>
-      <div style={{ marginLeft: "auto", color: "var(--muted)", fontSize: 12 }}>
-        Enterprise Security Intelligence Platform
+      <div style={{ marginLeft: "auto", display: "flex", alignItems: "center", gap: 12 }}>
+        <span style={{ color: "var(--muted)", fontSize: 12 }}>
+          Enterprise Security Intelligence Platform
+        </span>
+        {oidcEnabled() &&
+          (authed ? (
+            <button className="ghost" onClick={() => logout()}>
+              Sign out
+            </button>
+          ) : (
+            <button className="primary" onClick={() => login()}>
+              Sign in
+            </button>
+          ))}
       </div>
     </div>
   );

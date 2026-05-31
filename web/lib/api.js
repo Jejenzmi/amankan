@@ -3,11 +3,19 @@
 export const API_BASE =
   process.env.NEXT_PUBLIC_API_BASE || "http://localhost:8080";
 
-// Optional API key for when the backend has authentication enabled
-// (AMANKAN_API_KEYS). Sent as a Bearer token on every request.
+// Optional API key for when the backend has API-key auth enabled
+// (AMANKAN_API_KEYS). Used as a fallback when OIDC is not configured.
+import { oidcEnabled, getToken } from "@/lib/oidc";
+
 const API_KEY = process.env.NEXT_PUBLIC_API_KEY || "";
 
+// authHeaders prefers an OIDC bearer token (Keycloak login) when OIDC is
+// configured, falling back to a static API key otherwise.
 function authHeaders() {
+  if (oidcEnabled()) {
+    const tok = getToken();
+    return tok ? { Authorization: `Bearer ${tok}` } : {};
+  }
   return API_KEY ? { Authorization: `Bearer ${API_KEY}` } : {};
 }
 
