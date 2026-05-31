@@ -15,9 +15,10 @@ type Queue struct {
 	key string
 }
 
-func New(addr, key string) *Queue {
+// New builds a queue client. password may be empty (no auth).
+func New(addr, password, key string) *Queue {
 	return &Queue{
-		rdb: redis.NewClient(&redis.Options{Addr: addr}),
+		rdb: redis.NewClient(&redis.Options{Addr: addr, Password: password}),
 		key: key,
 	}
 }

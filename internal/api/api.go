@@ -3,6 +3,7 @@ package api
 
 import (
 	"context"
+	"encoding/csv"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -14,58 +15,92 @@ import (
 	"github.com/go-chi/chi/v5/middleware"
 	"github.com/google/uuid"
 
+	"github.com/amankan/amankan/internal/auth"
 	"github.com/amankan/amankan/internal/compliance"
 	"github.com/amankan/amankan/internal/graph"
 	"github.com/amankan/amankan/internal/models"
 	"github.com/amankan/amankan/internal/queue"
+	"github.com/amankan/amankan/internal/risk"
+	"github.com/amankan/amankan/internal/sla"
 	"github.com/amankan/amankan/internal/store"
+	"github.com/amankan/amankan/internal/threatintel"
 )
 
 type API struct {
-	store *store.Store
-	queue *queue.Queue
-	graph *graph.Graph // optional; nil when graph integration is disabled
+	store   *store.Store
+	queue   *queue.Queue
+	graph   *graph.Graph  // optional; nil when graph integration is disabled
+	auth    auth.Provider // API-key Authenticator or OIDC verifier
+	opts    Options
+	metrics *metrics
 }
 
-func New(st *store.Store, q *queue.Queue, g *graph.Graph) *API {
-	return &API{store: st, queue: q, graph: g}
+// Options carries HTTP-hardening configuration into the router.
+type Options struct {
+	CORSOrigins []string
+	RateLimit   float64
+}
+
+func New(st *store.Store, q *queue.Queue, g *graph.Graph, a auth.Provider, opts Options) *API {
+	if a == nil {
+		a, _ = auth.ParseKeys("") // disabled API-key authenticator = open access
+	}
+	return &API{store: st, queue: q, graph: g, auth: a, opts: opts, metrics: &metrics{}}
 }
 
 func (a *API) Router() http.Handler {
 	r := chi.NewRouter()
 	r.Use(middleware.RequestID)
+	r.Use(middleware.RealIP)
 	r.Use(middleware.Recoverer)
+	r.Use(a.observe) // metrics + structured access log
 	r.Use(middleware.Timeout(30 * time.Second))
+	r.Use(auth.SecurityHeaders)
+	r.Use(auth.CORS(a.opts.CORSOrigins))
+	r.Use(auth.RateLimit(a.opts.RateLimit, nil))
+	r.Use(auth.MaxBody(1 << 20)) // cap request bodies at 1 MiB
 
-	r.Get("/healthz", a.health)
+	r.Get("/healthz", a.health)      // liveness (no dependencies)
+	r.Get("/readyz", a.handleReadyz) // readiness (DB + Redis)
+	r.Get("/metrics", a.handleMetrics)
+	r.Get("/.well-known/security.txt", securityTxt) // RFC 9116 disclosure pointer
 
 	r.Route("/api/v1", func(r chi.Router) {
-		r.Get("/assets", a.listAssets)
-		r.Post("/assets", a.createAsset)
-		r.Get("/assets/{id}", a.getAsset)
+		r.Use(a.auth.Authenticate) // resolve API key → principal
+		r.Use(a.auditMiddleware)   // tamper-evident audit of mutations
 
-		r.Post("/assets/{id}/scans", a.startScan) // orchestrate a scan for an asset
-		r.Get("/scans", a.listScans)
-		r.Get("/scans/{id}", a.getScan)
+		viewer := a.auth.Require(auth.RoleViewer)
+		analyst := a.auth.Require(auth.RoleAnalyst)
+		admin := a.auth.Require(auth.RoleAdmin)
 
-		r.Get("/findings", a.listFindings) // ?asset_id= &scan_id=
-		r.Patch("/findings/{id}/status", a.updateFindingStatus)
+		// ---- read (viewer+) ----
+		r.With(viewer).Get("/assets", a.listAssets)
+		r.With(viewer).Get("/assets/{id}", a.getAsset)
+		r.With(viewer).Get("/scans", a.listScans)
+		r.With(viewer).Get("/scans/{id}", a.getScan)
+		r.With(viewer).Get("/findings", a.listFindings) // ?asset_id= &scan_id=
+		r.With(viewer).Get("/compliance/cwe/{cwe}", a.complianceForCWE)
+		r.With(viewer).Get("/graph/export", a.exportGraph)
+		r.With(viewer).Get("/assets/{id}/attack-paths", a.attackPaths) // ?min_risk= &max_hops=
+		r.With(viewer).Get("/assets/{id}/accounts", a.listAccounts)
+		r.With(viewer).Get("/privesc-path", a.privEscPath) // ?from= &to=
 
-		r.Get("/compliance/cwe/{cwe}", a.complianceForCWE)
+		// ---- operate (analyst+) ----
+		r.With(analyst).Post("/assets", a.createAsset)
+		r.With(analyst).Post("/assets/{id}/scans", a.startScan)
+		r.With(analyst).Patch("/findings/{id}/status", a.updateFindingStatus)
+		r.With(analyst).Get("/findings/export", a.exportFindings) // CSV (data egress)
 
-		// Graph Analysis Engine (attack paths / lateral movement).
-		r.Post("/graph/sync", a.graphSync)
-		r.Post("/graph/topology", a.importTopology) // bulk CAN_REACH import (CMDB feed)
-		r.Get("/graph/export", a.exportGraph)       // full graph for visualization
-		r.Post("/assets/{id}/reachability", a.addReachability)
-		r.Get("/assets/{id}/attack-paths", a.attackPaths) // ?min_risk= &max_hops=
-
-		// Privilege-escalation graph (accounts + weighted escalation/reuse edges).
-		r.Get("/assets/{id}/accounts", a.listAccounts)
-		r.Post("/accounts", a.createAccount)
-		r.Post("/accounts/{id}/escalation", a.addEscalation)
-		r.Post("/accounts/{id}/credential-reuse", a.addCredentialReuse)
-		r.Get("/privesc-path", a.privEscPath) // ?from= &to=
+		// ---- administer (admin only) ----
+		r.With(admin).Post("/graph/sync", a.graphSync)
+		r.With(admin).Post("/graph/topology", a.importTopology)        // bulk CAN_REACH import (CMDB)
+		r.With(admin).Post("/assets/{id}/authorize", a.authorizeAsset) // Layer-3 scan permission
+		r.With(admin).Post("/assets/{id}/reachability", a.addReachability)
+		r.With(admin).Post("/accounts", a.createAccount)
+		r.With(admin).Post("/accounts/{id}/escalation", a.addEscalation)
+		r.With(admin).Post("/accounts/{id}/credential-reuse", a.addCredentialReuse)
+		r.With(admin).Get("/audit", a.listAudit)          // tamper-evident audit log
+		r.With(admin).Get("/audit/verify", a.verifyAudit) // hash-chain integrity
 	})
 
 	return r
@@ -75,11 +110,12 @@ func (a *API) Router() http.Handler {
 
 func (a *API) createAsset(w http.ResponseWriter, r *http.Request) {
 	var in struct {
-		Name        string             `json:"name"`
-		Type        models.AssetType   `json:"type"`
-		Target      string             `json:"target"`
-		Criticality models.Criticality `json:"criticality"`
-		Tags        []string           `json:"tags"`
+		Name           string             `json:"name"`
+		Type           models.AssetType   `json:"type"`
+		Target         string             `json:"target"`
+		Criticality    models.Criticality `json:"criticality"`
+		Tags           []string           `json:"tags"`
+		ScanAuthorized bool               `json:"scan_authorized"`
 	}
 	if err := decode(r, &in); err != nil {
 		badRequest(w, err.Error())
@@ -95,7 +131,7 @@ func (a *API) createAsset(w http.ResponseWriter, r *http.Request) {
 	if in.Criticality == "" {
 		in.Criticality = models.CritMedium
 	}
-	asset := &models.Asset{Name: in.Name, Type: in.Type, Target: in.Target, Criticality: in.Criticality, Tags: in.Tags}
+	asset := &models.Asset{Name: in.Name, Type: in.Type, Target: in.Target, Criticality: in.Criticality, Tags: in.Tags, ScanAuthorized: in.ScanAuthorized}
 	if err := a.store.CreateAsset(r.Context(), asset); err != nil {
 		serverError(w, err)
 		return
@@ -109,7 +145,7 @@ func (a *API) listAssets(w http.ResponseWriter, r *http.Request) {
 		serverError(w, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, assets)
+	writeJSON(w, http.StatusOK, paginate(w, r, assets))
 }
 
 func (a *API) getAsset(w http.ResponseWriter, r *http.Request) {
@@ -119,6 +155,23 @@ func (a *API) getAsset(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, asset)
+}
+
+// authorizeAsset grants or revokes active-scan authorization for an asset
+// (admin only) — the auditable Layer-3 permission record.
+func (a *API) authorizeAsset(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		Authorized bool `json:"authorized"`
+	}
+	if err := decode(r, &in); err != nil {
+		badRequest(w, err.Error())
+		return
+	}
+	if err := a.store.SetAssetAuthorization(r.Context(), chi.URLParam(r, "id"), in.Authorized); err != nil {
+		notFoundOrError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"id": chi.URLParam(r, "id"), "scan_authorized": in.Authorized})
 }
 
 // ---- scans ----
@@ -155,7 +208,7 @@ func (a *API) listScans(w http.ResponseWriter, r *http.Request) {
 		serverError(w, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, jobs)
+	writeJSON(w, http.StatusOK, paginate(w, r, jobs))
 }
 
 func (a *API) getScan(w http.ResponseWriter, r *http.Request) {
@@ -172,12 +225,74 @@ func (a *API) getScan(w http.ResponseWriter, r *http.Request) {
 func (a *API) listFindings(w http.ResponseWriter, r *http.Request) {
 	assetID := r.URL.Query().Get("asset_id")
 	scanID := r.URL.Query().Get("scan_id")
-	findings, err := a.store.ListFindings(r.Context(), assetID, scanID)
+	limit, offset := pageParams(r)
+	findings, err := a.store.ListFindings(r.Context(), assetID, scanID, limit, offset)
 	if err != nil {
 		serverError(w, err)
 		return
 	}
+	enrichRuntime(findings)
 	writeJSON(w, http.StatusOK, findings)
+}
+
+const (
+	defaultPageLimit = 200
+	maxPageLimit     = 1000
+)
+
+// pageParams parses ?limit= & ?offset=, applying a sane default and hard cap so
+// list endpoints cannot be coerced into returning unbounded result sets.
+func pageParams(r *http.Request) (limit, offset int) {
+	limit = defaultPageLimit
+	if v := r.URL.Query().Get("limit"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			limit = n
+		}
+	}
+	if limit > maxPageLimit {
+		limit = maxPageLimit
+	}
+	if v := r.URL.Query().Get("offset"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			offset = n
+		}
+	}
+	return limit, offset
+}
+
+// paginate slices an in-memory list per the request's limit/offset and sets an
+// X-Total-Count header so clients can page. Used for the small, internally
+// referenced collections (assets, scans) that are not paginated at the DB.
+func paginate[T any](w http.ResponseWriter, r *http.Request, items []T) []T {
+	limit, offset := pageParams(r)
+	w.Header().Set("X-Total-Count", strconv.Itoa(len(items)))
+	if offset >= len(items) {
+		return []T{}
+	}
+	end := offset + limit
+	if end > len(items) {
+		end = len(items)
+	}
+	return items[offset:end]
+}
+
+// enrichRuntime decorates findings with data that is computed fresh on every
+// read rather than persisted: the EPSS exploitation probability (from the
+// threat-intel feed) and the severity-driven remediation SLA (due date, breach
+// state, days remaining).
+func enrichRuntime(findings []models.Finding) {
+	now := time.Now().UTC()
+	for i := range findings {
+		f := &findings[i]
+		f.EPSS = threatintel.EPSS(f.CVE)
+		if f.CVSSVector == "" {
+			f.CVSSVector = risk.RepresentativeVector(f.CWE)
+		}
+		due := sla.DueDate(f.Severity, f.CreatedAt)
+		f.DueDate = &due
+		f.SLABreached = sla.Breached(f.Status, f.Severity, f.CreatedAt, now)
+		f.SLADaysLeft = sla.DaysRemaining(f.Severity, f.CreatedAt, now)
+	}
 }
 
 func (a *API) updateFindingStatus(w http.ResponseWriter, r *http.Request) {
@@ -199,6 +314,73 @@ func (a *API) updateFindingStatus(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": string(in.Status)})
+}
+
+// exportFindings streams the (optionally filtered) findings as CSV for audit /
+// reporting — the enriched view an analyst would attach to a BSSN/ISO ticket.
+func (a *API) exportFindings(w http.ResponseWriter, r *http.Request) {
+	assetID := r.URL.Query().Get("asset_id")
+	scanID := r.URL.Query().Get("scan_id")
+	findings, err := a.store.ListFindings(r.Context(), assetID, scanID, 0, 0) // full set for the report
+	if err != nil {
+		serverError(w, err)
+		return
+	}
+	enrichRuntime(findings)
+	w.Header().Set("Content-Type", "text/csv; charset=utf-8")
+	w.Header().Set("Content-Disposition", `attachment; filename="amankan-findings.csv"`)
+
+	cw := csv.NewWriter(w)
+	defer cw.Flush()
+	_ = cw.Write([]string{
+		"risk_score", "severity", "known_exploit", "epss", "status", "scanner",
+		"title", "cwe", "cve", "cvss", "cvss_vector", "port", "service",
+		"due_date", "sla_breached", "iso27001", "bssn", "remediation",
+	})
+	for _, f := range findings {
+		due := ""
+		if f.DueDate != nil {
+			due = f.DueDate.Format("2006-01-02")
+		}
+		_ = cw.Write([]string{
+			strconv.FormatFloat(f.RiskScore, 'f', -1, 64),
+			string(f.Severity),
+			strconv.FormatBool(f.KnownExploit),
+			strconv.FormatFloat(f.EPSS, 'f', -1, 64),
+			string(f.Status),
+			string(f.Scanner),
+			f.Title,
+			f.CWE,
+			f.CVE,
+			strconv.FormatFloat(f.CVSS, 'f', -1, 64),
+			f.CVSSVector,
+			strconv.Itoa(f.Port),
+			f.Service,
+			due,
+			strconv.FormatBool(f.SLABreached),
+			frameworkControl(f.Compliance, "ISO27001"),
+			frameworkControl(f.Compliance, "BSSN"),
+			remediationSummary(f.Remediation),
+		})
+	}
+}
+
+// frameworkControl extracts the control id for a given framework from a
+// finding's compliance references (empty string if absent).
+func frameworkControl(refs []models.ComplianceRef, framework string) string {
+	for _, r := range refs {
+		if r.Framework == framework {
+			return r.Control
+		}
+	}
+	return ""
+}
+
+func remediationSummary(rem *models.RemediationGuide) string {
+	if rem == nil {
+		return ""
+	}
+	return rem.Summary
 }
 
 // ---- compliance ----
@@ -234,7 +416,7 @@ func (a *API) graphSync(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		syncedAssets++
-		findings, err := a.store.ListFindings(ctx, as.ID, "")
+		findings, err := a.store.ListFindings(ctx, as.ID, "", 0, 0)
 		if err != nil {
 			serverError(w, err)
 			return
@@ -568,6 +750,16 @@ func graphDisabled(w http.ResponseWriter) {
 
 func (a *API) health(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+}
+
+// securityTxt serves an RFC 9116 vulnerability-disclosure pointer.
+func securityTxt(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	_, _ = w.Write([]byte(
+		"Contact: mailto:security@amankan.example\n" +
+			"Expires: 2027-12-31T23:59:59Z\n" +
+			"Preferred-Languages: en, id\n" +
+			"Policy: https://github.com/amankan/amankan/blob/main/SECURITY.md\n"))
 }
 
 // ---- helpers ----

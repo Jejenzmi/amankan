@@ -386,13 +386,13 @@ func asSlice(v any) []any {
 // Hop is one node along an attack path, with the vulnerability that enables
 // compromise of that node (highest-risk exploitable vuln on it).
 type Hop struct {
-	AssetID     string  `json:"asset_id"`
-	AssetName   string  `json:"asset_name"`
-	Criticality string  `json:"criticality"`
-	Exposure    string  `json:"exposure"`
-	ViaVulnTitle string `json:"via_vuln_title,omitempty"`
-	ViaVulnCWE  string  `json:"via_vuln_cwe,omitempty"`
-	ViaVulnRisk float64 `json:"via_vuln_risk"`
+	AssetID      string  `json:"asset_id"`
+	AssetName    string  `json:"asset_name"`
+	Criticality  string  `json:"criticality"`
+	Exposure     string  `json:"exposure"`
+	ViaVulnTitle string  `json:"via_vuln_title,omitempty"`
+	ViaVulnCWE   string  `json:"via_vuln_cwe,omitempty"`
+	ViaVulnRisk  float64 `json:"via_vuln_risk"`
 }
 
 // AttackPath is a full chain from an exposed entry point to the target asset.
