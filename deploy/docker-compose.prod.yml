@@ -1,0 +1,126 @@
+# Production-oriented stack: Amankan API + worker (with real scanners), Postgres
+# (TLS), Redis (auth), Neo4j, and Keycloak (OIDC). Build context is the repo root.
+#
+#   ./scripts/gen-certs.sh                       # TLS certs into deploy/certs/
+#   cp deploy/.env.prod.example deploy/.env.prod # then edit secrets
+#   docker compose -f deploy/docker-compose.prod.yml --env-file deploy/.env.prod up -d --build
+#
+# This is a single-host reference. For multi-node / HA use the Kubernetes
+# manifests in deploy/k8s/.
+
+name: amankan
+
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: amankan
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set in .env.prod}
+      POSTGRES_DB: amankan
+    command:
+      - postgres
+      - -c
+      - ssl=on
+      - -c
+      - ssl_cert_file=/certs/server.crt
+      - -c
+      - ssl_key_file=/certs/server.key
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./certs/server.crt:/certs/server.crt:ro
+      - ./certs/server.key:/certs/server.key:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U amankan"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+  redis:
+    image: redis:7
+    command: ["redis-server", "--requirepass", "${REDIS_PASSWORD:?set in .env.prod}"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD}", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+  neo4j:
+    image: neo4j:5
+    environment:
+      NEO4J_AUTH: neo4j/${NEO4J_PASSWORD:?set in .env.prod}
+      NEO4J_PLUGINS: '["apoc"]'
+    volumes:
+      - neo4jdata:/data
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:7474 >/dev/null || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+  keycloak:
+    image: quay.io/keycloak/keycloak:26.0
+    command: ["start-dev", "--import-realm"]
+    environment:
+      KC_BOOTSTRAP_ADMIN_USERNAME: admin
+      KC_BOOTSTRAP_ADMIN_PASSWORD: ${KEYCLOAK_ADMIN_PASSWORD:?set in .env.prod}
+    volumes:
+      - ./keycloak/realm-amankan.json:/opt/keycloak/data/import/realm-amankan.json:ro
+    ports:
+      - "8081:8080"
+    restart: unless-stopped
+
+  api:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    environment:
+      AMANKAN_ENV: production
+      AMANKAN_HTTP_ADDR: ":8080"
+      AMANKAN_DATABASE_URL: "postgres://amankan:${POSTGRES_PASSWORD}@postgres:5432/amankan?sslmode=require"
+      AMANKAN_REDIS_ADDR: "redis:6379"
+      AMANKAN_REDIS_PASSWORD: ${REDIS_PASSWORD}
+      AMANKAN_NEO4J_URI: "bolt://neo4j:7687"
+      AMANKAN_NEO4J_PASS: ${NEO4J_PASSWORD}
+      AMANKAN_CORS_ORIGINS: ${CORS_ORIGINS:-https://localhost:3000}
+      AMANKAN_RATE_LIMIT: ${RATE_LIMIT:-20}
+      AMANKAN_TLS_CERT: /certs/api.crt
+      AMANKAN_TLS_KEY: /certs/api.key
+      AMANKAN_OIDC_ISSUER: ${OIDC_ISSUER:-}
+      AMANKAN_OIDC_AUDIENCE: ${OIDC_AUDIENCE:-amankan-api}
+      AMANKAN_API_KEYS: ${API_KEYS:-}
+      AMANKAN_THREATINTEL_FETCH: ${THREATINTEL_FETCH:-true}
+    volumes:
+      - ./certs/api.crt:/certs/api.crt:ro
+      - ./certs/api.key:/certs/api.key:ro
+    ports:
+      - "8080:8080"
+    depends_on:
+      postgres: {condition: service_healthy}
+      redis: {condition: service_healthy}
+    restart: unless-stopped
+
+  worker:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.worker
+    environment:
+      AMANKAN_ENV: production
+      AMANKAN_DATABASE_URL: "postgres://amankan:${POSTGRES_PASSWORD}@postgres:5432/amankan?sslmode=require"
+      AMANKAN_REDIS_ADDR: "redis:6379"
+      AMANKAN_REDIS_PASSWORD: ${REDIS_PASSWORD}
+      AMANKAN_NEO4J_URI: "bolt://neo4j:7687"
+      AMANKAN_NEO4J_PASS: ${NEO4J_PASSWORD}
+      AMANKAN_ALLOW_LIVE_SCAN: "true"
+      # Per-asset authorization is the default gate; set true only to authorize ALL targets.
+      AMANKAN_SCAN_AUTHORIZED: ${SCAN_AUTHORIZED:-false}
+    depends_on:
+      postgres: {condition: service_healthy}
+      redis: {condition: service_healthy}
+    restart: unless-stopped
+
+volumes:
+  pgdata:
+  neo4jdata:

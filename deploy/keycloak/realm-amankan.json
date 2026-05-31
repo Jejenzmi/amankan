@@ -1,0 +1,52 @@
+{
+  "realm": "amankan",
+  "enabled": true,
+  "sslRequired": "external",
+  "registrationAllowed": false,
+  "bruteForceProtected": true,
+  "roles": {
+    "realm": [
+      { "name": "amankan-viewer", "description": "Read-only access to Amankan" },
+      { "name": "amankan-analyst", "description": "Run scans, triage findings, export" },
+      { "name": "amankan-admin", "description": "Full administration incl. graph and audit" }
+    ]
+  },
+  "clients": [
+    {
+      "clientId": "amankan-dashboard",
+      "name": "Amankan Dashboard",
+      "enabled": true,
+      "publicClient": true,
+      "standardFlowEnabled": true,
+      "directAccessGrantsEnabled": true,
+      "redirectUris": ["https://localhost:3000/*", "http://localhost:3000/*"],
+      "webOrigins": ["+"],
+      "attributes": { "post.logout.redirect.uris": "+" },
+      "protocolMappers": [
+        {
+          "name": "audience-amankan-api",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-audience-mapper",
+          "config": {
+            "included.custom.audience": "amankan-api",
+            "access.token.claim": "true"
+          }
+        }
+      ]
+    }
+  ],
+  "users": [
+    {
+      "username": "soc-admin",
+      "enabled": true,
+      "credentials": [{ "type": "password", "value": "change-me", "temporary": true }],
+      "realmRoles": ["amankan-admin"]
+    },
+    {
+      "username": "soc-analyst",
+      "enabled": true,
+      "credentials": [{ "type": "password", "value": "change-me", "temporary": true }],
+      "realmRoles": ["amankan-analyst"]
+    }
+  ]
+}
