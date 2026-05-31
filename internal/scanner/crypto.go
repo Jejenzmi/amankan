@@ -32,14 +32,21 @@ type cryptoReport struct {
 func (c *Crypto) Scan(ctx context.Context, asset models.Asset) (RawResult, error) {
 	res := RawResult{Scanner: models.ScannerCrypto, Format: "crypto-json"}
 
-	if c.opts.AllowLiveScan && isSafeTarget(asset.Target) {
+	if c.opts.liveAllowed(asset) {
 		if rep, ok := probeTLS(ctx, asset.Target); ok {
 			res.Data, _ = json.Marshal(rep)
 			return res, nil
 		}
+		// liveAllowed but the handshake failed: in production this is an error
+		// (we won't fabricate a verdict); in dev fall through to mock.
+		if c.opts.Production {
+			return RawResult{}, fmt.Errorf("crypto: TLS probe of %q failed (host unreachable or no TLS on :443)", asset.Target)
+		}
+	} else if c.opts.Production {
+		return RawResult{}, fmt.Errorf("crypto: live scanning not permitted for %q and mock is disabled in production", asset.Target)
 	}
 
-	// Mock: represent a host still on TLS 1.0 with an undersized RSA key.
+	// Mock (development only): a host still on TLS 1.0 with an undersized RSA key.
 	rep := cryptoReport{
 		Target:     asset.Target,
 		TLSVersion: "1.0",

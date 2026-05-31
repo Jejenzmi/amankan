@@ -32,9 +32,12 @@ func NewProcessor(st *store.Store, g *graph.Graph, cfg config.Config) *Processor
 		graph: g,
 		cfg:   cfg,
 		opts: scanner.Options{
-			NmapBin:       cfg.NmapBin,
-			NucleiBin:     cfg.NucleiBin,
-			AllowLiveScan: cfg.AllowLiveScan,
+			NmapBin:        cfg.NmapBin,
+			NucleiBin:      cfg.NucleiBin,
+			GitleaksBin:    cfg.GitleaksBin,
+			AllowLiveScan:  cfg.AllowLiveScan,
+			Production:     cfg.IsProduction(),
+			ScanAuthorized: cfg.ScanAuthorized,
 		},
 	}
 }
@@ -69,10 +72,12 @@ func (p *Processor) Process(ctx context.Context, scanJobID string) error {
 	scanners := scanner.ForProfile(job.Profile, p.opts)
 	usedMock := false
 	total := 0
+	var scanErrs []string
 	for _, sc := range scanners {
 		raw, err := sc.Scan(scanCtx, *asset)
 		if err != nil {
 			log.Printf("scan %s: scanner %s error: %v", job.ID, sc.Type(), err)
+			scanErrs = append(scanErrs, fmt.Sprintf("%s: %v", sc.Type(), err))
 			continue
 		}
 		if raw.Mock {
@@ -125,10 +130,21 @@ func (p *Processor) Process(ctx context.Context, scanJobID string) error {
 		}
 	}
 
+	// Fail loudly when every scanner errored and nothing was produced — a scan
+	// that ran nothing must not be recorded as a clean "completed" result.
+	if total == 0 && len(scanErrs) > 0 {
+		msg := "all scanners failed: " + strings.Join(scanErrs, "; ")
+		if err := p.store.MarkFailed(ctx, job.ID, msg); err != nil {
+			return err
+		}
+		log.Printf("scan %s: failed — %s", job.ID, msg)
+		return nil
+	}
+
 	if err := p.store.MarkCompleted(ctx, job.ID, usedMock); err != nil {
 		return err
 	}
-	log.Printf("scan %s: completed, %d findings persisted (mock=%v)", job.ID, total, usedMock)
+	log.Printf("scan %s: completed, %d findings persisted (mock=%v, scanner_errors=%d)", job.ID, total, usedMock, len(scanErrs))
 	return nil
 }
 

@@ -22,9 +22,16 @@ RabbitMQ, ELK) are out of scope for Phase 1 and noted as integration seams.
 | Primary DB | PostgreSQL (transactional data) |
 | **Graph Analysis Engine** | **Neo4j** (`internal/graph`): assets + vulns as a graph, reachability edges, **attack-path / lateral-movement** detection |
 
+| **Dashboard** | **Next.js** (`web/`): asset/finding management, live scan status, remediation + compliance drill-down, attack-graph visualization |
+| **Security hardening** | API-key auth + **RBAC** (viewer/analyst/admin), config-driven CORS, security headers, per-IP rate limit |
+| **Tamper-evident audit** | append-only, SHA-256 **hash-chained** audit log of every mutation, with chain-integrity verification |
+| **Threat intelligence** | CISA **KEV** + FIRST.org **EPSS** feeds (offline fallback set) feeding risk scoring |
+| **Remediation SLA** | severity-driven due dates + breach tracking on every finding |
+| **Secure SDLC** | GitHub Actions CI: build/vet/test (race), **govulncheck**, **CycloneDX SBOM**, dashboard build |
+
 ### Not in Phase 1 (integration seams)
-Kubernetes Jobs, Keycloak OAuth2, RabbitMQ, ELK, immutable/signed logs,
-automated patch testing, Next.js dashboard.
+Kubernetes Jobs, Keycloak OAuth2/OIDC (the API-key RBAC here is the enforcement
+stand-in), RabbitMQ, ELK, external secret vault, automated patch testing.
 
 ## Architecture
 
@@ -67,13 +74,19 @@ make smoke
 | Method | Path | Description |
 | --- | --- | --- |
 | `GET` | `/healthz` | liveness |
+| `GET` | `/readyz` | readiness (DB + Redis reachable) |
+| `GET` | `/metrics` | Prometheus metrics |
 | `POST` | `/api/v1/assets` | register an asset (ingestion) |
 | `GET` | `/api/v1/assets` / `/assets/{id}` | list / get assets |
 | `POST` | `/api/v1/assets/{id}/scans` | orchestrate a scan (`profile`: `quick`\|`web`\|`critical`) |
+| `POST` | `/api/v1/assets/{id}/authorize` | grant/revoke active-scan authorization (admin) |
 | `GET` | `/api/v1/scans` / `/scans/{id}` | list / get scan jobs |
 | `GET` | `/api/v1/findings?asset_id=&scan_id=` | findings, sorted by risk score |
+| `GET` | `/api/v1/findings/export?asset_id=&scan_id=` | findings as **CSV** (audit/BSSN report) |
 | `PATCH` | `/api/v1/findings/{id}/status` | validate / mark false-positive / remediated |
 | `GET` | `/api/v1/compliance/cwe/{cwe}` | governance mapping + remediation for a CWE |
+| `GET` | `/api/v1/audit` | tamper-evident audit log (admin) |
+| `GET` | `/api/v1/audit/verify` | recompute the audit hash-chain integrity (admin) |
 | `POST` | `/api/v1/graph/sync` | (re)project all assets + findings into Neo4j |
 | `POST` | `/api/v1/graph/topology` | bulk-import `CAN_REACH` edges from a CMDB/topology feed (`edges[]`, assets by id or target) |
 | `GET` | `/api/v1/graph/export` | full attack graph (nodes + edges) for visualization |
@@ -215,6 +228,137 @@ root@db-crown [root]
 > network-discovery). Full arbitrary topology still comes from the CMDB feed,
 > since cross-subnet reachability isn't observable from one host's scan.
 
+## Dashboard (Next.js)
+
+A web UI in `web/` drives the whole pipeline across four views:
+
+- **Assets & Findings** — register assets, launch scans and watch their **live
+  status**, drill into each finding (description, evidence, CVSS/CVE, full
+  compliance mapping, remediation playbook), run the **validation workflow**
+  (validate / false-positive / remediated), and **export findings to CSV**.
+- **Scans** — full scan-job history (status, profile, duration, mock/live,
+  errors) plus **graph administration**: re-project into Neo4j and bulk-import
+  CAN_REACH edges from a CMDB/topology feed.
+- **Privilege Escalation** — manage `Account` principals, draw CAN_ESCALATE /
+  CREDENTIAL_REUSE edges, and run the **minimum-effort Dijkstra path** query.
+- **Attack Graph** — the full graph (network reachability + privilege escalation
+  + credential reuse) as an interactive force graph.
+
+```bash
+cd web
+nvm use            # Node 20–22 (see .nvmrc); Next.js 15 does not build on Node 25
+npm install
+npm run dev        # http://localhost:3000  (expects the API on :8080)
+```
+
+> Point the dashboard at the API with `NEXT_PUBLIC_API_BASE`. For **Keycloak SSO**
+> set `NEXT_PUBLIC_OIDC_ISSUER` + `NEXT_PUBLIC_OIDC_CLIENT_ID` (Authorization
+> Code + PKCE login is built in, with a `/callback` route and sign-in/out); the
+> obtained token is sent as the API bearer. Without OIDC, set
+> `NEXT_PUBLIC_API_KEY` to use API-key auth.
+>
+> **Node version matters:** the `@next/swc` native compiler deadlocks on Node 25,
+> so `next build`/`next dev` hang at "Creating an optimized production build".
+> Use Node 20–22 LTS (`nvm use` / `engines` in `web/package.json`).
+
+## Security & compliance hardening
+
+The platform is built to the controls expected of a security product itself,
+not just to scan for them:
+
+- **Authentication & RBAC** — two interchangeable identity backends behind one
+  RBAC model (`viewer` < `analyst` < `admin`): **OIDC/Keycloak** (RS256 JWT
+  verified against the realm JWKS, realm roles → Amankan roles) when
+  `AMANKAN_OIDC_ISSUER` is set, otherwise **API keys**
+  (`AMANKAN_API_KEYS="label:secret:role,..."`, constant-time compared). Reads need
+  `viewer`; scans / status / export need `analyst`; graph, accounts, audit and
+  scan-authorization need `admin`. *(ISO 27001 A.5.15/A.8.2 · OWASP ASVS V1/V4 ·
+  SOC 2 CC6.1)*
+- **Authorized scanning only (Layer 3)** — real scanning of non-RFC1918 targets
+  requires explicit authorization, recorded **per asset**
+  (`POST /assets/{id}/authorize`) or globally (`AMANKAN_SCAN_AUTHORIZED`), and is
+  audited. Scanning hosts you don't control is illegal; this gate prevents it by
+  accident.
+- **Transport & API hardening** — `AMANKAN_CORS_ORIGINS` allow-list (no more
+  wildcard), security headers (HSTS/CSP/X-Frame-Options/nosniff), and a per-IP
+  token-bucket rate limit (`AMANKAN_RATE_LIMIT` req/s). *(ASVS V9/V14)*
+- **Tamper-evident audit trail** — every state-changing request is appended to a
+  SHA-256 hash-chained log (`audit_log`); `GET /api/v1/audit/verify` recomputes
+  the chain and reports the first broken sequence. *(ISO 27001 A.8.15 · SOC 2
+  CC7 · BSSN forensic retention)*
+- **Threat intelligence** — point `AMANKAN_KEV_FEED` at a CISA KEV JSON export
+  and `AMANKAN_EPSS_FEED` at a FIRST.org EPSS CSV; otherwise an embedded KEV
+  fallback set is used. KEV drives the risk multiplier; EPSS is surfaced per
+  finding.
+- **Remediation SLA** — each finding carries a severity-driven due date
+  (critical 7d · high 30d · medium 90d · low 180d), breach flag and days
+  remaining, shown in the dashboard. *(PCI DSS Req. 6/11 · ISO 27001 A.8.8)*
+- **Transport & input** — optional TLS (`AMANKAN_TLS_CERT`/`_KEY`),
+  constant-time API-key comparison, 1 MiB request-body cap, paginated list
+  endpoints (`?limit=&offset=`, `X-Total-Count`), and graceful shutdown.
+  *(ASVS V9/V13)*
+- **Observability** — `/healthz` (liveness), `/readyz` (DB+Redis readiness),
+  `/metrics` (Prometheus), and structured JSON access logs. *(ISO 27001 A.8.16)*
+- **Secure SDLC** — `.github/workflows/ci.yml` runs `go build/vet/test -race`,
+  `govulncheck` (dependency CVEs), **gosec** (SAST), **gitleaks** (secret scan),
+  generates a **CycloneDX SBOM**, and builds the dashboard on Node 20; Dependabot
+  keeps deps current; runtime ships as a **distroless/non-root** image
+  ([Dockerfile](Dockerfile)). *(ISO 27001 A.8.28 · SLSA)*
+- **Governance** — [SECURITY.md](SECURITY.md) disclosure policy +
+  `/.well-known/security.txt` (RFC 9116), a [threat model](docs/threat-model.md)
+  and a [data-retention policy](docs/data-retention.md); findings carry a CVSS
+  v3.1 vector string. *(ISO 27001 A.5.5/A.6.8/A.5.34)*
+
+## Production mode (no mock data)
+
+By default the platform runs in **development** mode: scanners fall back to
+deterministic mock output when a tool is missing or a target is off-limits, so
+the pipeline runs end-to-end on any laptop. Set `AMANKAN_ENV=production` to make
+it **real**:
+
+- **No fabricated data** — if a scanner cannot run for real (binary missing,
+  target unauthorized, host unreachable) the scan job is marked **failed** with a
+  clear reason; it is never silently recorded as a clean result.
+- **Secure-by-default startup** — the API **refuses to boot** if production
+  config is insecure: no API keys, wildcard CORS, `sslmode=disable`, default
+  Neo4j password, no TLS, or no rate limit.
+- **Real scanners** — install `nmap`, `nuclei` and `gitleaks` (repo secret
+  scanning); set `AMANKAN_ALLOW_LIVE_SCAN=true`.
+- **Authorization gate** — real scanning of non-RFC1918 targets requires
+  `AMANKAN_SCAN_AUTHORIZED=true`, your explicit confirmation that you own / are
+  permitted to test the registered targets. **Scanning hosts you do not control
+  is illegal** — this flag exists so it cannot happen by accident.
+- **Live threat intel** — `AMANKAN_THREATINTEL_FETCH=true` pulls the current
+  CISA KEV + FIRST.org EPSS feeds at startup (or load files via `AMANKAN_KEV_FEED`
+  / `AMANKAN_EPSS_FEED` for air-gapped deployments).
+
+```bash
+AMANKAN_ENV=production \
+AMANKAN_API_KEYS="soc:$(openssl rand -hex 24):admin" \
+AMANKAN_CORS_ORIGINS=https://soc.example \
+AMANKAN_DATABASE_URL='postgres://…?sslmode=require' \
+AMANKAN_TLS_CERT=/etc/tls/cert.pem AMANKAN_TLS_KEY=/etc/tls/key.pem \
+AMANKAN_RATE_LIMIT=20 \
+AMANKAN_ALLOW_LIVE_SCAN=true AMANKAN_SCAN_AUTHORIZED=true \
+AMANKAN_THREATINTEL_FETCH=true \
+./bin/api
+```
+
+### Deploying it
+
+Turnkey artifacts ship in [deploy/](deploy/): a production
+[docker-compose](deploy/docker-compose.prod.yml) (Postgres+TLS, Redis-auth,
+Neo4j, **Keycloak**, API+worker), a [worker image](deploy/Dockerfile.worker) with
+`nmap`/`nuclei`/`gitleaks` baked in, a TLS [cert script](scripts/gen-certs.sh),
+a [Keycloak realm](deploy/keycloak/realm-amankan.json), and
+[Kubernetes manifests](deploy/k8s/amankan.yaml) (probes, non-root, NetworkPolicy,
+cert-manager Ingress). The full runbook — TLS, secrets/vault, backup/DR, SIEM log
+shipping, go-live checklist — is in [docs/deployment.md](docs/deployment.md).
+
+> Still yours to provide (infra/ops + governance, not code): the running
+> cluster, CA-issued certificates, a secret vault, and the **written
+> authorization** to scan each target.
+
 ## Layout
 
 ```
@@ -229,6 +373,10 @@ internal/
   normalize    scanner output → internal Finding schema
   risk         CVSS × criticality × threat-intel scoring
   compliance   CWE → OWASP/ISO27001/BSSN/COBIT + remediation
+  threatintel  CISA KEV + EPSS feeds (offline fallback)
+  sla          severity-driven remediation deadlines + breach state
+  auth         API-key authentication, RBAC, CORS, security headers, rate limit
+  audit        tamper-evident hash-chained audit record
   graph        Neo4j projection + attack-path / lateral-movement queries
   engine       single-job orchestration
 ```
@@ -236,5 +384,5 @@ internal/
 ## Next steps (toward the full platform)
 1. ~~Neo4j attack graph: network paths + privilege nodes (apoc Dijkstra) + auto-derived escalation **and** credential-reuse edges from scan findings~~ ✅ done — privilege layer is fully self-forming. Next: infer network `CAN_REACH` from a topology/CMDB feed so the network layer is automated too.
 2. Replace the Redis list with RabbitMQ + Kubernetes Jobs for isolated, scalable scans.
-3. Front with Keycloak (OAuth2/OIDC) and add the Next.js + Ant Design Pro dashboard.
-4. Sign + ship logs to immutable storage (BSSN forensic retention) and ELK.
+3. ~~Front with auth + add the dashboard~~ ✅ done — API-key RBAC + Next.js dashboard. Next: upgrade to full Keycloak (OAuth2/OIDC) + SSO/MFA.
+4. ~~Tamper-evident audit log~~ ✅ done (hash-chained). Next: ship signed logs to immutable storage / ELK and add TLS termination + external secret vault.

@@ -1,0 +1,22 @@
+{
+  "name": "amankan-dashboard",
+  "version": "0.1.0",
+  "private": true,
+  "engines": {
+    "node": ">=20 <=22"
+  },
+  "scripts": {
+    "dev": "next dev -p 3000",
+    "build": "next build",
+    "start": "next start -p 3000"
+  },
+  "dependencies": {
+    "next": "^15.5.18",
+    "react": "19.0.0",
+    "react-dom": "19.0.0",
+    "react-force-graph-2d": "1.27.1"
+  },
+  "overrides": {
+    "postcss": "^8.5.10"
+  }
+}

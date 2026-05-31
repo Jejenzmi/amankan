@@ -2,6 +2,7 @@ package scanner
 
 import (
 	"context"
+	"fmt"
 	"os/exec"
 
 	"github.com/amankan/amankan/internal/models"
@@ -19,15 +20,25 @@ func (n *Nuclei) Scan(ctx context.Context, asset models.Asset) (RawResult, error
 	res := RawResult{Scanner: models.ScannerNuclei, Format: "nuclei-jsonl"}
 
 	bin, err := exec.LookPath(n.opts.NucleiBin)
-	if err != nil || !n.opts.AllowLiveScan || !isSafeTarget(asset.Target) {
-		res.Data = mockNucleiJSONL(asset.Target)
-		res.Mock = true
-		return res, nil
+	if err != nil {
+		return n.opts.fallback(res, mockNucleiJSONL(asset.Target), "nuclei binary not found")
+	}
+	if !n.opts.liveAllowed(asset) {
+		return n.opts.fallback(res, mockNucleiJSONL(asset.Target), "live scanning not permitted for this target")
 	}
 
 	cmd := exec.CommandContext(ctx, bin, "-jsonl", "-silent", "-u", asset.Target)
 	out, runErr := cmd.Output()
 	if runErr != nil || len(out) == 0 {
+		// nuclei exits non-zero only on fatal errors; "no findings" yields empty
+		// output, which is a legitimate clean result (not a failure).
+		if runErr != nil && n.opts.Production {
+			return RawResult{}, fmt.Errorf("nuclei: scan of %q failed: %w", asset.Target, runErr)
+		}
+		if n.opts.Production {
+			res.Data = []byte("") // clean scan, no findings
+			return res, nil
+		}
 		res.Data = mockNucleiJSONL(asset.Target)
 		res.Mock = true
 		return res, nil

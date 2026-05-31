@@ -28,7 +28,7 @@ func main() {
 	}
 	defer pool.Close()
 
-	q := queue.New(cfg.RedisAddr, cfg.QueueKey)
+	q := queue.New(cfg.RedisAddr, cfg.RedisPassword, cfg.QueueKey)
 	if err := q.Ping(ctx); err != nil {
 		log.Fatalf("redis: %v", err)
 	}

@@ -1,0 +1,236 @@
+# Amankan on Kubernetes — reference manifests.
+# Apply:  kubectl apply -f deploy/k8s/amankan.yaml
+# Build & push images first (see docs/deployment.md), then set them below.
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: amankan
+---
+# Secrets — replace with a sealed-secret / external-secrets operator in real use.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: amankan-secrets
+  namespace: amankan
+type: Opaque
+stringData:
+  POSTGRES_PASSWORD: "change-me"
+  REDIS_PASSWORD: "change-me"
+  NEO4J_PASSWORD: "change-me"
+  DATABASE_URL: "postgres://amankan:change-me@postgres:5432/amankan?sslmode=require"
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: postgres
+  namespace: amankan
+spec:
+  serviceName: postgres
+  replicas: 1
+  selector: { matchLabels: { app: postgres } }
+  template:
+    metadata: { labels: { app: postgres } }
+    spec:
+      securityContext: { runAsUser: 999, fsGroup: 999 }
+      containers:
+        - name: postgres
+          image: postgres:16
+          args: ["-c", "ssl=on", "-c", "ssl_cert_file=/certs/tls.crt", "-c", "ssl_key_file=/certs/tls.key"]
+          env:
+            - { name: POSTGRES_USER, value: amankan }
+            - { name: POSTGRES_DB, value: amankan }
+            - name: POSTGRES_PASSWORD
+              valueFrom: { secretKeyRef: { name: amankan-secrets, key: POSTGRES_PASSWORD } }
+          ports: [{ containerPort: 5432 }]
+          volumeMounts:
+            - { name: data, mountPath: /var/lib/postgresql/data }
+            - { name: certs, mountPath: /certs, readOnly: true }
+          readinessProbe:
+            exec: { command: ["pg_isready", "-U", "amankan"] }
+            initialDelaySeconds: 5
+      volumes:
+        - name: certs
+          secret: { secretName: postgres-tls }
+  volumeClaimTemplates:
+    - metadata: { name: data }
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources: { requests: { storage: 10Gi } }
+---
+apiVersion: v1
+kind: Service
+metadata: { name: postgres, namespace: amankan }
+spec:
+  selector: { app: postgres }
+  ports: [{ port: 5432, targetPort: 5432 }]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: redis, namespace: amankan }
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: redis } }
+  template:
+    metadata: { labels: { app: redis } }
+    spec:
+      containers:
+        - name: redis
+          image: redis:7
+          command: ["sh", "-c", "redis-server --requirepass \"$REDIS_PASSWORD\""]
+          env:
+            - name: REDIS_PASSWORD
+              valueFrom: { secretKeyRef: { name: amankan-secrets, key: REDIS_PASSWORD } }
+          ports: [{ containerPort: 6379 }]
+---
+apiVersion: v1
+kind: Service
+metadata: { name: redis, namespace: amankan }
+spec:
+  selector: { app: redis }
+  ports: [{ port: 6379, targetPort: 6379 }]
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata: { name: neo4j, namespace: amankan }
+spec:
+  serviceName: neo4j
+  replicas: 1
+  selector: { matchLabels: { app: neo4j } }
+  template:
+    metadata: { labels: { app: neo4j } }
+    spec:
+      containers:
+        - name: neo4j
+          image: neo4j:5
+          env:
+            - name: NEO4J_AUTH
+              value: "neo4j/$(NEO4J_PASSWORD)"
+            - name: NEO4J_PASSWORD
+              valueFrom: { secretKeyRef: { name: amankan-secrets, key: NEO4J_PASSWORD } }
+            - { name: NEO4J_PLUGINS, value: '["apoc"]' }
+          ports: [{ containerPort: 7687 }, { containerPort: 7474 }]
+          volumeMounts: [{ name: data, mountPath: /data }]
+  volumeClaimTemplates:
+    - metadata: { name: data }
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources: { requests: { storage: 10Gi } }
+---
+apiVersion: v1
+kind: Service
+metadata: { name: neo4j, namespace: amankan }
+spec:
+  selector: { app: neo4j }
+  ports: [{ name: bolt, port: 7687, targetPort: 7687 }, { name: http, port: 7474, targetPort: 7474 }]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: api, namespace: amankan }
+spec:
+  replicas: 2
+  selector: { matchLabels: { app: api } }
+  template:
+    metadata: { labels: { app: api } }
+    spec:
+      securityContext: { runAsNonRoot: true, runAsUser: 65532 }
+      containers:
+        - name: api
+          image: ghcr.io/your-org/amankan-api:latest # <- set your image
+          env:
+            - { name: AMANKAN_ENV, value: production }
+            - { name: AMANKAN_REDIS_ADDR, value: "redis:6379" }
+            - { name: AMANKAN_NEO4J_URI, value: "bolt://neo4j:7687" }
+            - { name: AMANKAN_CORS_ORIGINS, value: "https://amankan.example" }
+            - { name: AMANKAN_RATE_LIMIT, value: "20" }
+            - { name: AMANKAN_THREATINTEL_FETCH, value: "true" }
+            - { name: AMANKAN_OIDC_ISSUER, value: "https://keycloak.example/realms/amankan" }
+            - { name: AMANKAN_OIDC_AUDIENCE, value: "amankan-api" }
+            - name: AMANKAN_DATABASE_URL
+              valueFrom: { secretKeyRef: { name: amankan-secrets, key: DATABASE_URL } }
+            - name: AMANKAN_REDIS_PASSWORD
+              valueFrom: { secretKeyRef: { name: amankan-secrets, key: REDIS_PASSWORD } }
+            - name: AMANKAN_NEO4J_PASS
+              valueFrom: { secretKeyRef: { name: amankan-secrets, key: NEO4J_PASSWORD } }
+          ports: [{ containerPort: 8080 }]
+          readinessProbe:
+            httpGet: { path: /readyz, port: 8080 }
+            initialDelaySeconds: 5
+          livenessProbe:
+            httpGet: { path: /healthz, port: 8080 }
+            initialDelaySeconds: 10
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: ["ALL"] }
+---
+apiVersion: v1
+kind: Service
+metadata: { name: api, namespace: amankan }
+spec:
+  selector: { app: api }
+  ports: [{ port: 80, targetPort: 8080 }]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: worker, namespace: amankan }
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: worker } }
+  template:
+    metadata: { labels: { app: worker } }
+    spec:
+      securityContext: { runAsNonRoot: true, runAsUser: 65532 }
+      containers:
+        - name: worker
+          image: ghcr.io/your-org/amankan-worker:latest # <- set your image (has nmap/nuclei/gitleaks)
+          env:
+            - { name: AMANKAN_ENV, value: production }
+            - { name: AMANKAN_REDIS_ADDR, value: "redis:6379" }
+            - { name: AMANKAN_NEO4J_URI, value: "bolt://neo4j:7687" }
+            - { name: AMANKAN_ALLOW_LIVE_SCAN, value: "true" }
+            - { name: AMANKAN_SCAN_AUTHORIZED, value: "false" } # authorize per-asset
+            - name: AMANKAN_DATABASE_URL
+              valueFrom: { secretKeyRef: { name: amankan-secrets, key: DATABASE_URL } }
+            - name: AMANKAN_REDIS_PASSWORD
+              valueFrom: { secretKeyRef: { name: amankan-secrets, key: REDIS_PASSWORD } }
+            - name: AMANKAN_NEO4J_PASS
+              valueFrom: { secretKeyRef: { name: amankan-secrets, key: NEO4J_PASSWORD } }
+---
+# Ingress (TLS terminated here; use cert-manager for real certs).
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: api
+  namespace: amankan
+  annotations:
+    cert-manager.io/cluster-issuer: letsencrypt-prod
+spec:
+  tls:
+    - hosts: ["amankan.example"]
+      secretName: amankan-api-tls
+  rules:
+    - host: amankan.example
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend: { service: { name: api, port: { number: 80 } } }
+---
+# Default-deny ingress; allow only intra-namespace + ingress controller.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: { name: default-deny-ingress, namespace: amankan }
+spec:
+  podSelector: {}
+  policyTypes: ["Ingress"]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: { name: allow-intra-namespace, namespace: amankan }
+spec:
+  podSelector: {}
+  policyTypes: ["Ingress"]
+  ingress:
+    - from:
+        - podSelector: {}

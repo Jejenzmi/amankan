@@ -4,19 +4,9 @@
 package risk
 
 import (
-	"strings"
-
 	"github.com/amankan/amankan/internal/models"
+	"github.com/amankan/amankan/internal/threatintel"
 )
-
-// knownExploited is a tiny stand-in for a CISA KEV / threat-intel feed. CVEs
-// here get a threat multiplier because they are exploited in the wild.
-var knownExploited = map[string]bool{
-	"CVE-2021-44228": true, // Log4Shell
-	"CVE-2021-4034":  true, // PwnKit (polkit pkexec LPE)
-	"CVE-2017-0144":  true, // EternalBlue
-	"CVE-2014-0160":  true, // Heartbleed
-}
 
 // criticalityWeight scales risk by business impact of the asset.
 func criticalityWeight(c models.Criticality) float64 {
@@ -53,17 +43,9 @@ func Score(cvss float64, cve string, crit models.Criticality) (float64, bool) {
 }
 
 // IsKnownExploited reports whether any of the (possibly comma-joined) CVEs is in
-// the threat-intel feed.
+// the threat-intel (CISA KEV) feed.
 func IsKnownExploited(cve string) bool {
-	if cve == "" {
-		return false
-	}
-	for _, c := range strings.Split(cve, ",") {
-		if knownExploited[strings.TrimSpace(c)] {
-			return true
-		}
-	}
-	return false
+	return threatintel.IsKEV(cve)
 }
 
 // SeverityToCVSS provides a representative base score when a tool reports only a
@@ -85,4 +67,24 @@ func SeverityToCVSS(sev models.Severity) float64 {
 
 func round1(f float64) float64 {
 	return float64(int(f*10+0.5)) / 10
+}
+
+// cweVectors maps a weakness class to a representative CVSS v3.1 base vector.
+// This gives every finding the standard vector notation expected by
+// international tooling without each scanner having to emit one.
+var cweVectors = map[string]string{
+	"CWE-327":  "CVSS:3.1/AV:N/AC:H/PR:N/UI:N/S:U/C:H/I:N/A:N", // weak crypto / TLS
+	"CWE-502":  "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H", // unsafe deserialization (RCE)
+	"CWE-798":  "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:N", // hard-coded credentials
+	"CWE-269":  "CVSS:3.1/AV:L/AC:L/PR:L/UI:N/S:U/C:H/I:H/A:H", // privilege escalation
+	"CWE-250":  "CVSS:3.1/AV:L/AC:L/PR:L/UI:N/S:U/C:H/I:H/A:H", // excessive privilege
+	"CWE-538":  "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:N/A:N", // sensitive file exposure
+	"CWE-693":  "CVSS:3.1/AV:N/AC:L/PR:N/UI:R/S:U/C:L/I:L/A:N", // missing security headers
+	"CWE-1327": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:L/I:N/A:N", // exposed service
+}
+
+// RepresentativeVector returns a CVSS v3.1 base vector for a finding's weakness
+// class, or "" when none is known.
+func RepresentativeVector(cwe string) string {
+	return cweVectors[cwe]
 }

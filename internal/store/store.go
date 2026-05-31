@@ -23,6 +23,9 @@ type Store struct {
 
 func New(pool *pgxpool.Pool) *Store { return &Store{pool: pool} }
 
+// Ping verifies database connectivity (used by the readiness probe).
+func (s *Store) Ping(ctx context.Context) error { return s.pool.Ping(ctx) }
+
 // ---- Assets ----
 
 func (s *Store) CreateAsset(ctx context.Context, a *models.Asset) error {
@@ -32,17 +35,30 @@ func (s *Store) CreateAsset(ctx context.Context, a *models.Asset) error {
 		a.Tags = []string{}
 	}
 	_, err := s.pool.Exec(ctx,
-		`INSERT INTO assets (id,name,type,target,criticality,tags,created_at)
-		 VALUES ($1,$2,$3,$4,$5,$6,$7)`,
-		a.ID, a.Name, a.Type, a.Target, a.Criticality, a.Tags, a.CreatedAt)
+		`INSERT INTO assets (id,name,type,target,criticality,tags,scan_authorized,created_at)
+		 VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
+		a.ID, a.Name, a.Type, a.Target, a.Criticality, a.Tags, a.ScanAuthorized, a.CreatedAt)
 	return err
+}
+
+// SetAssetAuthorization marks (or unmarks) an asset as authorized for active
+// scanning. Returns ErrNotFound when the asset does not exist.
+func (s *Store) SetAssetAuthorization(ctx context.Context, id string, authorized bool) error {
+	tag, err := s.pool.Exec(ctx, `UPDATE assets SET scan_authorized=$2 WHERE id=$1`, id, authorized)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	return nil
 }
 
 func (s *Store) GetAsset(ctx context.Context, id string) (*models.Asset, error) {
 	row := s.pool.QueryRow(ctx,
-		`SELECT id,name,type,target,criticality,tags,created_at FROM assets WHERE id=$1`, id)
+		`SELECT id,name,type,target,criticality,tags,scan_authorized,created_at FROM assets WHERE id=$1`, id)
 	var a models.Asset
-	if err := row.Scan(&a.ID, &a.Name, &a.Type, &a.Target, &a.Criticality, &a.Tags, &a.CreatedAt); err != nil {
+	if err := row.Scan(&a.ID, &a.Name, &a.Type, &a.Target, &a.Criticality, &a.Tags, &a.ScanAuthorized, &a.CreatedAt); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, ErrNotFound
 		}
@@ -55,9 +71,9 @@ func (s *Store) GetAsset(ctx context.Context, id string) (*models.Asset, error) 
 // CMDB/topology import to reference assets by address instead of UUID.
 func (s *Store) GetAssetByTarget(ctx context.Context, target string) (*models.Asset, error) {
 	row := s.pool.QueryRow(ctx,
-		`SELECT id,name,type,target,criticality,tags,created_at FROM assets WHERE target=$1 LIMIT 1`, target)
+		`SELECT id,name,type,target,criticality,tags,scan_authorized,created_at FROM assets WHERE target=$1 LIMIT 1`, target)
 	var a models.Asset
-	if err := row.Scan(&a.ID, &a.Name, &a.Type, &a.Target, &a.Criticality, &a.Tags, &a.CreatedAt); err != nil {
+	if err := row.Scan(&a.ID, &a.Name, &a.Type, &a.Target, &a.Criticality, &a.Tags, &a.ScanAuthorized, &a.CreatedAt); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, ErrNotFound
 		}
@@ -68,7 +84,7 @@ func (s *Store) GetAssetByTarget(ctx context.Context, target string) (*models.As
 
 func (s *Store) ListAssets(ctx context.Context) ([]models.Asset, error) {
 	rows, err := s.pool.Query(ctx,
-		`SELECT id,name,type,target,criticality,tags,created_at FROM assets ORDER BY created_at DESC`)
+		`SELECT id,name,type,target,criticality,tags,scan_authorized,created_at FROM assets ORDER BY created_at DESC`)
 	if err != nil {
 		return nil, err
 	}
@@ -76,7 +92,7 @@ func (s *Store) ListAssets(ctx context.Context) ([]models.Asset, error) {
 	out := []models.Asset{}
 	for rows.Next() {
 		var a models.Asset
-		if err := rows.Scan(&a.ID, &a.Name, &a.Type, &a.Target, &a.Criticality, &a.Tags, &a.CreatedAt); err != nil {
+		if err := rows.Scan(&a.ID, &a.Name, &a.Type, &a.Target, &a.Criticality, &a.Tags, &a.ScanAuthorized, &a.CreatedAt); err != nil {
 			return nil, err
 		}
 		out = append(out, a)
@@ -177,11 +193,18 @@ func (s *Store) CreateFinding(ctx context.Context, f *models.Finding) error {
 }
 
 // ListFindings returns findings, optionally filtered by asset and/or scan job.
-func (s *Store) ListFindings(ctx context.Context, assetID, scanJobID string) ([]models.Finding, error) {
+// A limit > 0 bounds the page (with offset); limit <= 0 returns all matches
+// (used by internal callers such as graph sync and CSV export).
+func (s *Store) ListFindings(ctx context.Context, assetID, scanJobID string, limit, offset int) ([]models.Finding, error) {
 	q := `SELECT id,scan_job_id,asset_id,scanner,title,description,severity,cvss,cve,cwe,port,service,evidence,status,risk_score,known_exploit,compliance,remediation,created_at
 	      FROM findings WHERE ($1='' OR asset_id::text=$1) AND ($2='' OR scan_job_id::text=$2)
 	      ORDER BY risk_score DESC, created_at DESC`
-	rows, err := s.pool.Query(ctx, q, assetID, scanJobID)
+	args := []any{assetID, scanJobID}
+	if limit > 0 {
+		q += ` LIMIT $3 OFFSET $4`
+		args = append(args, limit, offset)
+	}
+	rows, err := s.pool.Query(ctx, q, args...)
 	if err != nil {
 		return nil, err
 	}

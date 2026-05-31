@@ -32,7 +32,10 @@ type Asset struct {
 	Target      string      `json:"target"` // IP, domain, or repo URL
 	Criticality Criticality `json:"criticality"`
 	Tags        []string    `json:"tags"`
-	CreatedAt   time.Time   `json:"created_at"`
+	// ScanAuthorized records explicit permission to actively scan this target.
+	// In production, real scanning requires this (or the global override).
+	ScanAuthorized bool      `json:"scan_authorized"`
+	CreatedAt      time.Time `json:"created_at"`
 }
 
 // ScanProfile is a named risk profile selecting which scanners run.
@@ -102,26 +105,34 @@ const (
 // Finding is a normalized vulnerability/observation produced by a scanner and
 // enriched with risk score and compliance references.
 type Finding struct {
-	ID        string        `json:"id"`
-	ScanJobID string        `json:"scan_job_id"`
-	AssetID   string        `json:"asset_id"`
-	Scanner   ScannerType   `json:"scanner"`
-	Title     string        `json:"title"`
-	Desc      string        `json:"description"`
-	Severity  Severity      `json:"severity"`
-	CVSS      float64       `json:"cvss"`
-	CVE       string        `json:"cve,omitempty"`
-	CWE       string        `json:"cwe,omitempty"` // e.g. "CWE-327"
-	Port      int           `json:"port,omitempty"`
-	Service   string        `json:"service,omitempty"`
-	Evidence  string        `json:"evidence,omitempty"`
-	Status    FindingStatus `json:"status"`
+	ID         string        `json:"id"`
+	ScanJobID  string        `json:"scan_job_id"`
+	AssetID    string        `json:"asset_id"`
+	Scanner    ScannerType   `json:"scanner"`
+	Title      string        `json:"title"`
+	Desc       string        `json:"description"`
+	Severity   Severity      `json:"severity"`
+	CVSS       float64       `json:"cvss"`
+	CVSSVector string        `json:"cvss_vector,omitempty"` // CVSS v3.1 vector (computed at read time)
+	CVE        string        `json:"cve,omitempty"`
+	CWE        string        `json:"cwe,omitempty"` // e.g. "CWE-327"
+	Port       int           `json:"port,omitempty"`
+	Service    string        `json:"service,omitempty"`
+	Evidence   string        `json:"evidence,omitempty"`
+	Status     FindingStatus `json:"status"`
 
 	// Enrichment (computed at normalization time).
-	RiskScore   float64           `json:"risk_score"`
-	KnownExploit bool             `json:"known_exploit"`
-	Compliance  []ComplianceRef   `json:"compliance,omitempty"`
-	Remediation *RemediationGuide `json:"remediation,omitempty"`
+	RiskScore    float64           `json:"risk_score"`
+	KnownExploit bool              `json:"known_exploit"`
+	Compliance   []ComplianceRef   `json:"compliance,omitempty"`
+	Remediation  *RemediationGuide `json:"remediation,omitempty"`
+
+	// Runtime enrichment (computed at read time, not persisted): EPSS
+	// exploitation probability and the severity-driven remediation SLA.
+	EPSS        float64    `json:"epss,omitempty"`
+	DueDate     *time.Time `json:"due_date,omitempty"`
+	SLABreached bool       `json:"sla_breached"`
+	SLADaysLeft int        `json:"sla_days_left"`
 
 	// Transient scan-time metadata for credential findings (CWE-798). Populated
 	// by the normalizer and consumed by the graph engine to infer credential
